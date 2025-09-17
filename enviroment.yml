@@ -1,0 +1,24 @@
+name: wrf_python_assimilation
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - netcdf4
+  - xarray
+  - wrf-python
+  - matplotlib
+  - seaborn
+  - pyyaml
+  - tqdm
+  - jupyter
+  - ipykernel
+  - compilers
+  - fortran-compiler
+  - threadpoolctl
+  - pip
+  - pip:
+      - snakeviz
+      - line_profiler
+      - scalene
