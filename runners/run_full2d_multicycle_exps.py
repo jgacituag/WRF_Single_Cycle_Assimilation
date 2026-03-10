@@ -128,7 +128,7 @@ def main():
     date_ini = da_cfg.get("init_date")
     date_end = da_cfg.get("end_date")
     freq     = da_cfg.get("freq")
-    members = [20]#np.arange(30)
+    members = np.arange(30)
     dates = pd.date_range(start=pd.to_datetime(date_ini,format="%Y-%m-%d_%H:%M:%S"), end=pd.to_datetime(date_end,format="%Y-%m-%d_%H:%M:%S"), freq=freq)
     print(f"[info] running data assimilation for {len(dates)} dates from {date_ini} to {date_end} every {freq}")
     for date in dates:
