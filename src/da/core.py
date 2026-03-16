@@ -1,30 +1,7 @@
-"""
-src/da/core.py
-==============
-Single source of truth for all DA methods used in the WS experiments.
-
-Public API
-----------
-  tempering_schedule(ntemp, alpha_s)             -> ndarray (ntemp,)
-  compute_hxf(xf, ox, oy, oz, var_idx)           -> ndarray (nobs, Ne)
-  aoei(yo, hxf, R0)                              -> ndarray (nobs,)
-  letkf_update(xf, yo, R0, ox, oy, oz, L, vi)   -> dict
-  tenkf_update(..., ntemp, alpha_s)              -> dict
-  aoei_update(...)                               -> dict
-  atenkf_update(..., ntemp, alpha_s)             -> dict
-
-Conventions
------------
-- obs_error / R0 : always obs error VARIANCE (sigma^2), NOT std.
-- sigma_dbz in configs is std; square it before passing here.
-- All heavy arrays are float32.
-- The Fortran backend is loaded lazily so unit tests run without it.
-"""
-
 import os, sys
 import numpy as np
 
-# ── Verbosity ──────────────────────────────────────────────────────────────
+# ── Verbosity 
 # 0=silent  1=method start/finish  2=per-step  3=debug
 # Set once per process with set_verbose(level).
 
@@ -39,9 +16,8 @@ def _log(level: int, msg: str):
     if _VERBOSE >= level:
         print(msg, flush=True)
 
-# ── Lazy Fortran loader ────────────────────────────────────────────────────
-
 _cda = None
+
 
 def _get_cda():
     global _cda
@@ -64,8 +40,6 @@ def _get_cda():
     )
 
 
-# ── Tempering schedule ─────────────────────────────────────────────────────
-
 def tempering_schedule(ntemp: int, alpha_s: float) -> np.ndarray:
     """
     Back-loaded exponential weights (Eq. 12).
@@ -85,8 +59,6 @@ def tempering_schedule(ntemp: int, alpha_s: float) -> np.ndarray:
     w /= w.sum()
     return w.astype(np.float32)
 
-
-# ── Observation operator ───────────────────────────────────────────────────
 
 def compute_hxf(xf_grid: np.ndarray,
                 ox: np.ndarray,
@@ -124,8 +96,6 @@ def compute_hxf(xf_grid: np.ndarray,
     return hxf
 
 
-# ── AOEI ───────────────────────────────────────────────────────────────────
-
 def aoei(yo: np.ndarray,
          hxf: np.ndarray,
          R0: np.ndarray) -> np.ndarray:
@@ -157,8 +127,6 @@ def aoei(yo: np.ndarray,
     return np.maximum(R0_, d**2 - sigma2_f).astype(np.float32)
 
 
-# ── Single LETKF step ──────────────────────────────────────────────────────
-
 def _letkf_step(xf_grid, hxf, yo, obs_error_var, ox, oy, oz, loc_scales):
     """
     One LETKF analysis via Fortran.  obs_error_var is R (variance).
@@ -187,8 +155,6 @@ def _letkf_step(xf_grid, hxf, yo, obs_error_var, ox, oy, oz, loc_scales):
     )
     return xa.astype(np.float32)
 
-
-# ── High-level DA methods ──────────────────────────────────────────────────
 
 def letkf_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx):
     """
@@ -470,8 +436,6 @@ def atenkf_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx,
         ntemp_max=ntemp_max,
     )
 
-
-# ── TAOEI ──────────────────────────────────────────────────────────────────
 
 def taoei_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx,
                  ntemp: int, alpha_s: float):
