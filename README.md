@@ -113,7 +113,7 @@ alpha_i = exp(-(Nt+1)*alpha_s / i) / sum_j exp(-(Nt+1)*alpha_s / j)
 ```
 
 `sum(alpha_i) = 1` guarantees that total information across all steps equals
-`1/R0` (information-preserving property). Larger `alpha_s` back-loads weight
+`R0` (information-preserving property). Larger `alpha_s` back-loads weight
 toward later iterations; `alpha_s = 0` gives equal weights.
 
 ---
