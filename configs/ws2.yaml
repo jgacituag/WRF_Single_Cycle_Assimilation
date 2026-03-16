@@ -1,27 +1,32 @@
-# configs/ws2.yaml
-# WS-2: Method comparison at 3 obs positions, all 30 truth members
-experiment: WS-2
+# WS-2: Full single-observation grid sweep — all methods, all truth members
+experiment_tag: WS2_full_sweep
+verbose: 1
+skip_existing: True
 
 paths:
-  prepared: /path/to/state_ensemble.npz   # <- change this
-  outdir:   /path/to/output/ws2/          # <- change this
+  prepared: /path/to/state_ensemble.npz
+  outdir:   /path/to/output/ws2/
 
 state:
+  n_members: 30
   var_idx: {qg: 0, qr: 1, qs: 2, T: 3, P: 4, u: 5, v: 6, w: 7}
 
 obs:
-  sigma_dbz: 5.0
+  obs_error_var: 5.0
 
-# Three observation positions — update after running obs_explorer_ws2.ipynb
-# Dummy values (0,0,0) used until positions are chosen
-obs_positions:
-  A_near_mean:  {x: 0, y: 0, z: 0}
-  B_above_mean: {x: 0, y: 0, z: 0}
-  C_below_mean: {x: 0, y: 0, z: 0}
+qc:
+  filter_ensemble: true
+  filter_truth:    false
+  filter_mode:     and
+  dbz_min:         5.0
 
-da:
-  ntemp: 3          # Ntemp for TEnKF/ATEnKF (fix from WS-1 results)
+sweep:
+  truth_members: all
+  obs_points:
+    mode: full_grid
+  methods: [LETKF, TEnKF, AOEI, ATEnKF, TAOEI]
+  ntemp: 3           # fix from WS-1 results
   alpha_s: 2.0
-  loc_scales: [5, 5, 5]
-
-experiment_tag: WS2_position_comparison
+  loc_x: 5.0
+  loc_y: 5.0
+  loc_z: 5.0

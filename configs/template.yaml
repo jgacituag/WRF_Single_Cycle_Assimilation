@@ -1,0 +1,157 @@
+# configs/template.yaml
+# =====================
+# Full reference template for WRF Single-Cycle Assimilation experiments.
+# Every possible option is shown with a description.
+# Copy this file, rename it (e.g. ws1.yaml), and fill in your values.
+#
+# Runner:
+#   python src/runners/run_experiment.py --config configs/your_exp.yaml
+#   python src/runners/run_experiment.py --config configs/your_exp.yaml --workers 30
+#
+# On the cluster:
+#   EXP=your_exp qsub queue_ws.sh
+
+# ── metadata ──────────────────────────────────────────────────────────────
+experiment_tag: MY_EXPERIMENT    # used in output filenames and the config copy
+
+# Verbosity level written to log / stdout
+#   0  silent except fatal errors
+#   1  one line per truth member  (recommended for cluster runs)
+#   2  one line per method/combo per member
+#   3  full per-step output from DA core  (debugging only)
+verbose: 1
+
+skip_existing: False   # default — always overwrite npz file
+skip_existing: True    # resume a partial run without recomputing finished npz files
+# ── paths ─────────────────────────────────────────────────────────────────
+paths:
+  # Input: .npz produced by src/extract_3d_subset.py
+  # Must contain array "state_ensemble" of shape (nx, ny, nz, Ne_tot, nvar)
+  prepared: /path/to/state_ensemble.npz
+
+  # Output directory. Will be created if it does not exist.
+  # A copy of this config file is written here before any results.
+  outdir: /path/to/output/
+
+# ── state ─────────────────────────────────────────────────────────────────
+state:
+  # Total number of members in the .npz (truth + prior)
+  n_members: 30
+
+  # Variable index mapping — must match how the .npz was built
+  # (see src/extract_3d_subset.py for the canonical order)
+  var_idx: {qg: 0, qr: 1, qs: 2, T: 3, P: 4, u: 5, v: 6, w: 7}
+
+# ── observations ──────────────────────────────────────────────────────────
+obs:
+  # Observation error VARIANCE [dBZ²]  (NOT std — do not square this)
+  obs_error_var: 25.0    # corresponds to sigma = 5 dBZ
+
+# ── quality control ───────────────────────────────────────────────────────
+qc:
+  # Skip points where the ensemble mean in obs space is below dbz_min.
+  # Physical motivation: no signal in observation space -> no correction possible.
+  filter_ensemble: true     # recommended: always true
+
+  # Skip points where the truth (yo) is below dbz_min.
+  # Optional: isolates the nonlinear regime where the ensemble underestimates.
+  filter_truth: false
+
+  # How to combine filter_ensemble and filter_truth when both are true:
+  #   "and"  skip only if BOTH conditions fail  (less aggressive filtering)
+  #   "or"   skip if EITHER condition fails     (more aggressive filtering)
+  filter_mode: and
+
+  # Reflectivity threshold [dBZ] used by both filters above
+  dbz_min: 5.0
+
+# ── sweep ─────────────────────────────────────────────────────────────────
+# Every dimension supports three formats:
+#   scalar:              5         -> [5]
+#   explicit list:       [3, 5, 7] -> [3, 5, 7]
+#   range (inclusive):   {start: 1, stop: 10, num: 10}  -> [1,2,...,10]
+#
+# All combinations of (methods x ntemp x alpha_s x loc_x x loc_y x loc_z)
+# are run for every truth member and every obs set.
+
+sweep:
+
+  # Which truth members to use.
+  # "all" runs all n_members.  Or provide a scalar / list / range.
+  truth_members: all
+  # truth_members: 0
+  # truth_members: [0, 1, 2]
+  # truth_members: {start: 0, stop: 29, num: 30}
+
+  # ── observation set ───────────────────────────────────────────────────
+  # Controls how observations are constructed for each run.
+  #
+  # mode: single
+  #   One fixed grid point as a single observation.
+  #   Use for WS-1 (Ntemp sweep) and targeted single-point tests.
+  #
+  # mode: full_grid
+  #   Every QC-passing grid point is run as an INDEPENDENT single observation.
+  #   The prior xf is the same for all points (fresh each time, not sequential).
+  #   Produces one output file per (truth_member, point, combo).
+  #   Use for WS-2 (full innovation-space characterization).
+  #
+  # mode: strided
+  #   All QC-passing points on a ::stride subgrid, assimilated TOGETHER
+  #   in a single LETKF call.
+  #   Use for WS-3 / WS-4 (multiple-obs, dense network).
+  #
+  # mode: all
+  #   All QC-passing points assimilated together (stride=1).
+  #   Use for full-domain assimilation tests.
+
+  obs_points:
+    mode: single
+    loc: {x: 0, y: 0, z: 0}    # only for mode: single
+
+  # obs_points:
+  #   mode: full_grid           # WS-2
+
+  # obs_points:
+  #   mode: strided             # WS-3 / WS-4
+  #   stride: 2
+
+  # obs_points:
+  #   mode: all                 # full domain
+
+  # ── DA methods ────────────────────────────────────────────────────────
+  methods: [LETKF, TEnKF, AOEI, ATEnKF, TAOEI]
+  # methods: [LETKF]
+
+  # ── tempering iterations ──────────────────────────────────────────────
+  # Integer parameter.  {start, stop, num} uses rounded linspace values.
+  ntemp: 3
+  # ntemp: [1, 2, 3]
+  # ntemp: {start: 1, stop: 10, num: 10}   # -> [1,2,3,4,5,6,7,8,9,10]
+
+  # ── tempering slope ───────────────────────────────────────────────────
+  # Controls back-loading of the tempering schedule (Eq. 12).
+  # 0 = equal weights.  Recommended range: [1, 2].
+  alpha_s: 2.0
+  # alpha_s: [1.0, 2.0, 3.0]
+  # alpha_s: {start: 0.0, stop: 3.0, num: 4}
+
+  # ── localization length scales [grid points] ──────────────────────────
+  # Separate values for x (west-east), y (south-north), z (vertical).
+  # Use 9999 (or null) to disable localization on an axis.
+  # R-localization: obs error inflated by exp(0.5*(d/L)^2) at distance d.
+  loc_x: 5.0
+  loc_y: 5.0
+  loc_z: 5.0
+  # loc_x: [3.0, 5.0, 7.0, 10.0]
+  # loc_z: {start: 2.0, stop: 8.0, num: 4}
+  # loc_x: null    # disables x-localization (L=9999)
+
+# ── parallelism ───────────────────────────────────────────────────────────
+# Handled at the command line (--workers N) or in queue_ws.sh.
+# Each truth member runs in its own process; all processes are independent.
+# Recommended: workers = min(n_truth_members, available_cores)
+#
+# Internal threading is disabled in queue_ws.sh (OMP_NUM_THREADS=1 etc.)
+# so each worker process is truly single-threaded and the OS schedules
+# workers across cores without contention.

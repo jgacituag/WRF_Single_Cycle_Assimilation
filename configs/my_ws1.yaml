@@ -1,0 +1,21 @@
+# configs/ws1.yaml
+# WS-1: Ntemp sweep — single obs, all 30 truth members, fixed alpha_s=2
+experiment: WS-1
+
+paths:
+  prepared: /home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation/data/3D_subsets/ensemble_3D_sections_2023-12-16_19:00:00.npz   # <- change this
+  outdir:   /home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation/data/ws1_below/          # <- change this
+
+state:
+  var_idx: {qg: 0, qr: 1, qs: 2, T: 3, P: 4, u: 5, v: 6, w: 7}
+
+obs:
+  loc: {x: 42, y: 79, z: 14}   # <- update after running S2_obs_explorer_ws2
+  sigma_dbz: 5.0             # obs error Variance in dBZ (squared to variance internally)
+
+da:
+  ntemp_sweep: [1, 2]
+  alpha_s: 2.0
+  loc_scales: [5, 5, 5]     # localization length scales [x, y, z] in grid points
+
+experiment_tag: WS1_Ntemp_sweep
