@@ -1,33 +1,57 @@
-# WS-1: Ntemp sweep — single observation, all truth members
+# configs/ws1.yaml
+# ================
+# WS-1: Ntemp sweep
+#
+# Scientific question: how many tempering iterations are needed in 3D WRF
+# before performance saturates?
+#
+# Design:
+#   - Single observation at a fixed grid location
+#   - Methods: LETKF (baseline, Ntemp=1) and TEnKF for Ntemp = 1..10
+#   - Fixed alpha_s = 2.0
+#   - All 30 truth members
+#
+# Runner:
+#   python src/runners/run_experiment.py --config configs/ws1.yaml --workers 30
+#
+# Before running:
+#   1. Set paths.prepared to your extracted .npz
+#   2. Set paths.outdir
+#   3. Update sweep.obs_points.loc with a point that has reflectivity
+#      (use Notebook 1 or the obs_explorer notebook to find a good point)
+
 experiment_tag: WS1_Ntemp_sweep
-verbose: 1
-skip_existing: True
+verbose: 3
+skip_existing: false
 
 paths:
-  prepared: /path/to/state_ensemble.npz
-  outdir:   /path/to/output/ws1/
+  prepared: /home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation/data/3D_subsets_20240319_DAFCST_20240319180000/subset_20240320180000.npz
+  outdir:   /home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation/data/ws1_below/
 
 state:
-  n_members: 30
+  n_members: 60
   var_idx: {qg: 0, qr: 1, qs: 2, T: 3, P: 4, u: 5, v: 6, w: 7}
 
 obs:
-  obs_error_var: 5.0 
+  obs_error_var: 5.0    # variance [dBZ²]  (sigma = 5 dBZ)
 
 qc:
-  filter_ensemble: false
+  filter_ensemble: true
   filter_truth:    false
   filter_mode:     and
   dbz_min:         5.0
 
 sweep:
-  truth_members: all
+  truth_members: 0 #all
+  prior_size:    20 #null      # use all remaining members
+
   obs_points:
     mode: single
-    loc: {x: 0, y: 0, z: 0}   # update after obs_explorer notebook
-  methods: [LETKF, TEnKF]
-  ntemp: {start: 1, stop: 10, num: 10}
+    loc: {x: 84, y: 108, z: 5}   # <- update with a precipitating point
+
+  methods: [TEnKF]
+  ntemp:   {start: 1, stop: 3, num: 3}   # -> [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
   alpha_s: 2.0
-  loc_x: 5.0
-  loc_y: 5.0
-  loc_z: 5.0
+  loc_x:   5.0
+  loc_y:   5.0
+  loc_z:   1.0

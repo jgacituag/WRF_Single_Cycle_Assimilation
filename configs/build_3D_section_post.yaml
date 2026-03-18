@@ -1,0 +1,29 @@
+# build_3D_section_post.yaml
+# Config for extracting a 3D subset from postprocessed CF-convention files.
+# File naming pattern: WRF.D{date}.T3D.M{member}.nc
+
+cross_sections_job:
+  format: post      # plain netCDF4, no wrf-python needed
+
+  paths:
+    pattern:   "/home/jruiz/datosdemerzel/PREVENIR_HIRESOLUTION_DA_FUGAKU_2024031900_5MIN_WINIT/POST/DAFCST/{init}/WRF.D{date}.T3D.M{member}.nc"
+    output:    "/home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation/data/3D_subsets_20240319_DAFCST_20240319180000/subset_{date}.npz"
+    date_fmt:   "%Y%m%d%H%M%S"        # -> 20240320180000
+    start:       "20240319180000"       # fixed init time for this job
+    init_date: "2024-03-20_18:00:00"
+    end_date:   "2024-03-20_18:00:00"
+    freq:       "1H"
+
+  ensemble:
+    mem_ini: 1
+    mem_end: 60
+    pad:     3      # member strings: 001, 002, ..., 060
+
+  subset_3d:
+    # No timeidx needed — postprocessed files have exactly one time step
+    k_start: 0      # vertical level start (null = 0, i.e. lowest level)
+    k_end:   -1      # vertical level end   (null = top)
+    j_start: 0      # south-north start  <- fill from Notebook 1
+    j_end:   -1      # south-north end
+    i_start: 0      # west-east start
+    i_end:   -1      # west-east end

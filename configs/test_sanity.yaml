@@ -1,0 +1,30 @@
+# configs/test_sanity.yaml
+# ========================
+# Minimal config for running the sanity check.
+# Used with:
+#   python tests/run_sanity_check.py --config configs/test_sanity.yaml
+#   python tests/run_sanity_check.py --config configs/test_sanity.yaml \
+#       --truth 0 --x 10 --y 0 --z 5
+#
+# Set paths.prepared to your extracted .npz file.
+# The obs point (--x, --y, --z) defaults to 0,0,0 — choose a point
+# with non-zero reflectivity for a meaningful check (use Notebook 1
+# or the obs_explorer notebook to find good candidates).
+
+paths:
+  prepared: "/home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation/data/3D_subsets_20240319_DAFCST_20240319180000/subset_20240320180000.npz"
+
+state:
+  n_members: 30
+  var_idx: {qg: 0, qr: 1, qs: 2, T: 3, P: 4, u: 5, v: 6, w: 7}
+
+obs:
+  obs_error_var: 5.0    #
+
+sweep:
+  methods: [LETKF, TEnKF, AOEI, ATEnKF, TAOEI]
+  ntemp:   3
+  alpha_s: 2.0
+  loc_x:   5.0
+  loc_y:   5.0
+  loc_z:   5.0

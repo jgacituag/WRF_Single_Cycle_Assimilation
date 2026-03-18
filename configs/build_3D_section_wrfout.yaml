@@ -1,0 +1,26 @@
+# build_3D_section_wrfout.yaml
+# Config for extracting a 3D subset from native WRF output files.
+
+cross_sections_job:
+  format: wrfout    # use wrf-python to read wrfout files
+
+  paths:
+    pattern:   "/path/{member}/wrfout_d01_{date}"
+    output:    "/path/output/subset_{date}.npz"
+    init_date: "2023-12-16_19:00:00"
+    end_date:  "2023-12-16_19:00:00"
+    freq:      "1H"
+
+  ensemble:
+    mem_ini: 1
+    mem_end: 30
+    pad:     3      # member strings: 001, 002, ..., 030
+
+  subset_3d:
+    timeidx: -1     # time index within file (-1 = last)
+    k_start: ~      # vertical level start (null = 0)
+    k_end:   ~      # vertical level end   (null = top)
+    j_start: ~      # south-north start  <- fill from Notebook 1
+    j_end:   ~      # south-north end
+    i_start: ~      # west-east start
+    i_end:   ~      # west-east end

@@ -83,6 +83,7 @@ def compute_hxf(xf_grid: np.ndarray,
     nobs = len(ox)
     Ne   = xf_grid.shape[3]
     hxf  = np.empty((nobs, Ne), dtype=np.float32)
+    _log(3, f"Computing H(xf) for {nobs} obs and {Ne} ensemble members...")
     for ii in range(nobs):
         i, j, k = int(ox[ii]), int(oy[ii]), int(oz[ii])
         for m in range(Ne):
@@ -143,7 +144,7 @@ def _letkf_step(xf_grid, hxf, yo, obs_error_var, ox, oy, oz, loc_scales):
     dep    = (yo - hxf.mean(axis=1)).astype(np.float32)
     oerr_f = np.asarray(obs_error_var, np.float32)
     locs_f = np.asarray(loc_scales,    np.float32)
-
+    _log(3, f"Running LETKF step with obs_error_var mean={oerr_f.mean():.2f} and nobs={nobs}...")
     xa = cda.simple_letkf_wloc(
         nx=nx, ny=ny, nz=nz,
         nbv=Ne, nvar=nvar, nobs=nobs,

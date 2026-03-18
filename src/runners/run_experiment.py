@@ -21,16 +21,14 @@ Obs modes (set via sweep.obs_points in config)
 
 Sweep dimensions (all support scalar, list, or {start, stop, num})
 -------------------------------------------------------------------
-  truth_members, methods, ntemp, alpha_s, loc_x, loc_y, loc_z
+  truth_members, prior_size, methods, ntemp, alpha_s, loc_x, loc_y, loc_z
 
 Output files
 ------------
   Single-obs:
-    {tag}_{method}_Nt{nt}_as{as}_Lx{lx}Ly{ly}Lz{lz}_obs{x}_{y}_{z}_qc{qc}_True{tm}.npz
+    {tag}_{method}_Nt{nt}_as{as}_Lx{lx}Ly{ly}Lz{lz}_Ne{ne}_obs{x}_{y}_{z}_qc{qc}_True{tm}.npz
   Multi-obs:
-    {tag}_{method}_Nt{nt}_as{as}_Lx{lx}Ly{ly}Lz{lz}_str{stride}_qc{qc}_True{tm}.npz
-  Full-grid sweep flat table:
-    {tag}_results_qc{qc}.npz
+    {tag}_{method}_Nt{nt}_as{as}_Lx{lx}Ly{ly}Lz{lz}_Ne{ne}_str{stride}_qc{qc}_True{tm}.npz
 
   Config copy: {outdir}/{tag}_config.yaml  (written before any results)
 """
@@ -58,7 +56,7 @@ from da.core import (
 )
 
 
-#  sweep parameter helpers 
+# ## sweep parameter helpers ################################################
 
 def _expand(val, is_int=False):
     """
@@ -83,9 +81,9 @@ def _expand_loc(cfg_val):
     """
     Expand a localization axis value.
     Accepts scalar, list, or {start,stop,num}.
-    99999 or null/None means no localization.
+    9999 or null/None means no localization.
     """
-    vals = _expand(cfg_val if cfg_val is not None else 99999)
+    vals = _expand(cfg_val if cfg_val is not None else 9999)
     return [float(v) for v in vals]
 
 
@@ -120,7 +118,7 @@ def _qc_pass(yo_val, hxf_mean_val, qc_cfg):
     return not fail_e if fe else not fail_t
 
 
-#  observation operator
+# ## observation operator ###################################################
 
 def _calc_hx_domain(state_nvar, var_idx):
     """
@@ -171,7 +169,7 @@ def _hx_point(state_nvar, i, j, k, var_idx):
                      for m in range(state_nvar.shape[0])], np.float32)
 
 
-#  method dispatcher 
+# ## method dispatcher ######################################################
 
 def _run_method(method, xf, yo, R0, ox, oy, oz, loc_scales, var_idx, ntemp, alpha_s):
     if method == "LETKF":
@@ -190,7 +188,7 @@ def _run_method(method, xf, yo, R0, ox, oy, oz, loc_scales, var_idx, ntemp, alph
     raise ValueError(f"Unknown method: {method}")
 
 
-#  filename builders 
+# ## filename builders ######################################################
 
 def _fmt(v):
     """Format a float for filenames: no trailing zeros."""
@@ -200,14 +198,14 @@ def _fmt(v):
 def _select_prior(ens, tm, prior_size=None):
     """
     Split ensemble into truth and prior.
- 
+
     Parameters
     ----------
     ens        : (nx, ny, nz, Ne_tot, nvar)
     tm         : index of the truth member
     prior_size : number of prior members to use (None = all remaining,
                  sequential starting from index 0, skipping tm)
- 
+
     Returns
     -------
     truth : (nx, ny, nz, nvar)
@@ -226,15 +224,15 @@ def _select_prior(ens, tm, prior_size=None):
     truth = ens[:, :, :, tm, :]
     xf    = ens[:, :, :, all_others, :].astype(np.float32)
     return truth, xf, len(all_others)
- 
- 
+
+
 def _fname_single(tag, method, ntemp, alpha_s, lx, ly, lz,
                   ne, ox, oy, oz, qc, tm):
     return (f"{tag}_{method}_Nt{ntemp:02d}_as{_fmt(alpha_s)}"
             f"_Lx{_fmt(lx)}Ly{_fmt(ly)}Lz{_fmt(lz)}"
             f"_Ne{ne:03d}_obs{ox}_{oy}_{oz}_qc{qc}_True{tm:02d}.npz")
- 
- 
+
+
 def _fname_multi(tag, method, ntemp, alpha_s, lx, ly, lz,
                  ne, stride_str, qc, tm):
     return (f"{tag}_{method}_Nt{ntemp:02d}_as{_fmt(alpha_s)}"
@@ -242,21 +240,20 @@ def _fname_multi(tag, method, ntemp, alpha_s, lx, ly, lz,
             f"_Ne{ne:03d}_str{stride_str}_qc{qc}_True{tm:02d}.npz")
 
 
-#  per-truth-member worker 
+# ## per-truth-member worker ################################################
 
 def _worker(args):
     (tm, ens, cfg, verbose) = args
     core.set_verbose(verbose)
- 
+
     sweep    = cfg["sweep"]
-    da_cfg   = cfg["da"]
     qc_cfg   = cfg.get("qc", {})
     var_idx  = cfg["state"]["var_idx"]
     outdir   = cfg["paths"]["outdir"]
     tag      = cfg.get("experiment_tag", "EXP")
     R0_val   = float(cfg["obs"]["obs_error_var"])
     qc       = _qc_code(qc_cfg)
- 
+
     obs_cfg  = sweep["obs_points"]
     if isinstance(obs_cfg, str):
         obs_mode = obs_cfg           # "full_grid" or "all"
@@ -266,7 +263,7 @@ def _worker(args):
         obs_mode = obs_cfg.get("mode", "single")
         obs_loc  = obs_cfg.get("loc", None)      # {x,y,z} for single
         stride   = int(obs_cfg.get("stride", 2)) # for strided
- 
+
     methods     = _expand(sweep.get("methods",    ["LETKF"]))
     ntemps      = _expand(sweep.get("ntemp",      [1]), is_int=True)
     alphas      = _expand(sweep.get("alpha_s",    [2.0]))
@@ -275,30 +272,30 @@ def _worker(args):
     lzs         = _expand_loc(sweep.get("loc_z",  5.0))
     prior_sizes = _expand(sweep["prior_size"], is_int=True) \
                   if sweep.get("prior_size") is not None else [None]
- 
+
     # Truth H(x) is fixed for a given tm regardless of prior_size —
     # compute it once here outside the prior_size loop.
     truth_base = ens[:, :, :, tm, :]
     truth_hx   = _calc_hx_domain(truth_base, var_idx)   # (nx,ny,nz)
     nx, ny, nz = truth_base.shape[:3]
- 
+
     t0 = time.time()
     core._log(1, f"[truth {tm:02d}] start  domain={nx}x{ny}x{nz}"
                  f"  prior_sizes={prior_sizes}")
- 
+
     combos = list(itertools.product(methods, ntemps, alphas, lxs, lys, lzs))
     saved  = []
- 
+
     for prior_size in prior_sizes:
- 
-        #  split truth / prior for this ensemble size 
+
+        # ## split truth / prior for this ensemble size #################
         _, xf, Ne = _select_prior(ens, tm, prior_size)
         ens_hx    = _calc_hx_domain(xf, var_idx)          # (nx,ny,nz,Ne)
         ens_mean  = ens_hx.mean(axis=3)                    # (nx,ny,nz)
- 
+
         core._log(2, f"  [truth {tm:02d}] Ne={Ne}")
- 
-        #  build obs array(s) 
+
+        # ## build obs array(s) #########################################
         if obs_mode == "single":
             i0, j0, k0 = int(obs_loc["x"]), int(obs_loc["y"]), int(obs_loc["z"])
             obs_sets = [(
@@ -308,7 +305,7 @@ def _worker(args):
                 np.array([truth_hx[i0,j0,k0]], np.float32),
                 f"{i0}_{j0}_{k0}",
             )]
- 
+
         elif obs_mode == "full_grid":
             obs_sets = []
             for i in range(nx):
@@ -324,7 +321,7 @@ def _worker(args):
                             ))
             core._log(1, f"  [truth {tm:02d}] Ne={Ne}  full_grid: "
                          f"{len(obs_sets)}/{nx*ny*nz} pts pass QC")
- 
+
         else:  # "strided" or "all"
             s = stride if obs_mode == "strided" else 1
             ix, iy, iz, yo_vals = [], [], [], []
@@ -343,25 +340,27 @@ def _worker(args):
             )]
             core._log(1, f"  [truth {tm:02d}] Ne={Ne}  {obs_mode}: "
                          f"{len(ix)}/{nx*ny*nz} pts pass QC")
- 
+
         if not obs_sets:
             core._log(1, f"  [truth {tm:02d}] Ne={Ne}  no valid obs, skipping")
             continue
- 
-        #  sweep combos 
+
+        # ## sweep combos ###############################################
         for (ox_arr, oy_arr, oz_arr, yo_arr, loc_str) in obs_sets:
             R0 = np.full(len(yo_arr), R0_val, np.float32)
- 
+
             for (method, ntemp, alpha_s, lx, ly, lz) in combos:
                 loc_scales = np.array([lx, ly, lz], np.float32)
- 
+
                 if obs_mode in ("single", "full_grid"):
                     fname = _fname_single(tag, method, ntemp, alpha_s,
-                                          lx, ly, lz, Ne, loc_str, qc, tm)
+                                          lx, ly, lz, Ne,
+                                          ox_arr[0], oy_arr[0], oz_arr[0],
+                                          qc, tm)
                 else:
                     fname = _fname_multi(tag, method, ntemp, alpha_s,
                                          lx, ly, lz, Ne, loc_str, qc, tm)
- 
+
                 out_path = os.path.join(outdir, fname)
                 if os.path.exists(out_path):
                     if cfg.get("skip_existing", False):
@@ -369,14 +368,14 @@ def _worker(args):
                         saved.append(fname)
                         continue
                     # else: overwrite (default)
- 
+
                 core._log(2, f"  {method} Ne={Ne} Nt={ntemp} as={alpha_s} "
                              f"L=[{lx},{ly},{lz}] obs={loc_str}")
- 
+
                 res = _run_method(method, xf, yo_arr, R0,
                                   ox_arr, oy_arr, oz_arr,
                                   loc_scales, var_idx, ntemp, alpha_s)
- 
+
                 hxf_pt = ens_hx[ox_arr, oy_arr, oz_arr, :]  # (nobs, Ne)
                 save = dict(
                     xa=res["xa"],
@@ -395,16 +394,16 @@ def _worker(args):
                             "ntemps_per_obs","obs_error_aoei","obs_error_eff"):
                     if key in res:
                         save[key] = res[key]
- 
+
                 np.savez_compressed(out_path, **save)
                 saved.append(fname)
- 
+
     elapsed = time.time() - t0
     core._log(1, f"[truth {tm:02d}] done  {len(saved)} files  {elapsed:.1f}s")
     return saved
 
 
-#  main
+# ## main ###################################################################
 
 def main():
     ap = argparse.ArgumentParser()
