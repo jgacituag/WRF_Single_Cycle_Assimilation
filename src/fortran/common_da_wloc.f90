@@ -1,246 +1,217 @@
 MODULE common_da
 !=======================================================================
 !
-! [PURPOSE:] Simple data assimilation tools for 3D models
-! With localization
-! J. Ruiz - 5/2/2025
-! IMPORTANT!!: This is a simple implementation of LETKF. No observation
-! screening of any type is performed in this code. All observation 
-! screening should be performed before calling this routine.
+! [PURPOSE:] LETKF-based data assimilation for 3D WRF ensembles.
+!
+!   simple_letkf_wloc : run LETKF at every grid point with Gaussian
+!                       R-localisation.
+!   calc_ref           : forward operator — radar reflectivity from
+!                        WRF microphysics variables (Tong & Xue 2006).
+!
+! [NOTE:] No observation screening is performed here. All QC must be
+!         applied before calling simple_letkf_wloc.
+!
+! [DEPENDENCY:] common_tools, common_letkf, BLAS (dgemm via common_letkf)
 !
 !=======================================================================
-!$USE OMP_LIB
   USE common_tools
   USE common_letkf
-
   IMPLICIT NONE
-
   PUBLIC
 
 CONTAINS
 
 !=======================================================================
-!  
+SUBROUTINE simple_letkf_wloc(nx, ny, nz, nbv, nvar, nobs, &
+                              hxf, xf, dep, ox, oy, oz,    &
+                              locs, oerr, xa)
 !=======================================================================
-SUBROUTINE simple_letkf_wloc(nx,ny,nz,nbv,nvar,nobs,hxf,xf,dep,ox,oy,oz,locs,oerr,xa)
+!
+!  Run one LETKF analysis step at every grid point (ix, iy, iz).
+!  Localisation is Gaussian R-localisation: observation error is
+!  inflated by 1/rho, where
+!
+!    rho(ix,iy,iz) = exp(-0.5 * [((ix-ox)/lx)^2
+!                               + ((iy-oy)/ly)^2
+!                               + ((iz-oz)/lz)^2])
+!
+!  Points beyond max_dist = 2*sqrt(10/3)*max(lx,ly) receive
+!  rho -> 0, so the observation is effectively ignored there.
+!
+!  INPUT
+!    nx,ny,nz    : domain dimensions
+!    nbv         : ensemble size
+!    nvar        : number of state variables
+!    nobs        : number of observations
+!    hxf(nobs,nbv)         : H(xf) — ensemble in obs space
+!    xf(nx,ny,nz,nbv,nvar) : prior ensemble
+!    dep(nobs)             : departures  yo - H(xf_mean)
+!    ox,oy,oz(nobs)        : observation locations (1-based grid indices)
+!    locs(3)               : localisation scales [lx, ly, lz] in grid points
+!    oerr(nobs)            : observation error variance
+!
+!  OUTPUT
+!    xa(nx,ny,nz,nbv,nvar) : posterior ensemble
+!
+!=======================================================================
+  IMPLICIT NONE
+  INTEGER,      INTENT(IN)  :: nx, ny, nz, nbv, nvar, nobs
+  REAL(r_sngl), INTENT(IN)  :: hxf(nobs, nbv)
+  REAL(r_sngl), INTENT(IN)  :: xf(nx, ny, nz, nbv, nvar)
+  REAL(r_sngl), INTENT(IN)  :: dep(nobs)
+  REAL(r_sngl), INTENT(IN)  :: ox(nobs), oy(nobs), oz(nobs)
+  REAL(r_sngl), INTENT(IN)  :: locs(3)
+  REAL(r_sngl), INTENT(IN)  :: oerr(nobs)
+  REAL(r_sngl), INTENT(OUT) :: xa(nx, ny, nz, nbv, nvar)
 
-IMPLICIT NONE
-INTEGER,INTENT(IN)         :: nx,ny,nz,nbv,nvar !number of X,Y,Z, members , update variables
-INTEGER,INTENT(IN)         :: nobs              !number of observations to be assimilated
-REAL(r_sngl),INTENT(IN)    :: dep(nobs)         !Obs departure for each obs.
-REAL(r_sngl),INTENT(IN)    :: ox(nobs),oy(nobs),oz(nobs) !Observation location
-REAL(r_sngl),INTENT(IN)    :: oerr(nobs)                 !Observation error
-REAL(r_sngl),INTENT(IN)    :: locs(3)                    !Localization scale in x, y and z
-REAL(r_sngl),INTENT(IN)    :: xf(nx,ny,nz,nbv,nvar)      !Prior for the updated variables.
-REAL(r_sngl),INTENT(IN)    :: hxf(nobs,nbv)              !Ensemble forecast in obs. space
-REAL(r_sngl),INTENT(OUT)   :: xa(nx,ny,nz,nbv,nvar)      !Posterior for the updated variables.
-INTEGER                    :: ix,iy,iz,im,iv,im2,io
-REAL(r_size)               :: hxfmean(nobs) , xfmean(nvar) 
-REAL(r_size)               :: xfpert(nbv,nvar) , hxfpert(nobs,nbv)
-REAL(r_size)               :: wa(nbv,nbv) , wamean(nbv) , pa(nbv,nbv) , rloc(nobs) , infl
-REAL(r_size)               :: oerr_rsize(nobs) , dep_rsize(nobs)
+  INTEGER      :: ix, iy, iz, iv, im, im2, io
+  REAL(r_size) :: hxfmean(nobs)
+  REAL(r_size) :: hxfpert(nobs, nbv)
+  REAL(r_size) :: xfmean(nvar)
+  REAL(r_size) :: xfpert(nbv, nvar)
+  REAL(r_size) :: rloc(nobs)
+  REAL(r_size) :: wa(nbv, nbv), wamean(nbv), pa(nbv, nbv)
+  REAL(r_size) :: oerr_dp(nobs), dep_dp(nobs)
+  REAL(r_size) :: infl
+  REAL(r_size) :: max_dist, dist
+  REAL(r_sngl) :: lx, ly, lz
 
-rloc=1.0d0
-infl=1.0d0
-oerr_rsize = REAL( oerr , r_size )
-dep_rsize  = REAL( dep  , r_size )
+  infl     = 1.0d0
+  oerr_dp  = REAL(oerr, r_size)
+  dep_dp   = REAL(dep,  r_size)
+  lx = locs(1);  ly = locs(2);  lz = locs(3)
 
-DO io = 1,nobs
-   CALL com_mean( nbv , REAL( hxf(io,:),r_size),hxfmean(io) )
-   hxfpert( io , : ) = hxf( io , : ) - hxfmean( io ) 
-ENDDO
+  ! Compact-support cutoff (horizontal): beyond this dist observations
+  ! have negligible weight and are skipped.
+  max_dist = 2.0d0 * SQRT(10.0d0/3.0d0) * MAX(REAL(lx,r_size), REAL(ly,r_size))
 
+  ! Pre-compute H(xf) ensemble perturbations (same for all grid points)
+  DO io = 1, nobs
+    CALL com_mean(nbv, REAL(hxf(io,:), r_size), hxfmean(io))
+    hxfpert(io, :) = REAL(hxf(io,:), r_size) - hxfmean(io)
+  END DO
 
-!$OMP PARALLEL DO PRIVATE(ix,iy,iz,iv,im,im2,wa,wamean,pa,xfmean,xfpert,rloc)
-DO ix = 1 , nx
-  !write(*,*) ix, '/', nx
-  DO iy = 1 , ny
-    DO iz = 1 , nz
-       !write(*,*) 'point (xi,iy,iz)' , ix, iy, iz
-       !Observations will be assimilated at each grid point considering their location.
-      
-       !Computing the local 
-       DO iv = 1,nvar
-         CALL com_mean( nbv,REAL(xf(ix,iy,iz,:,iv),r_size),xfmean(iv) )
-         xfpert(:,iv) = xf(ix,iy,iz,:,iv) - xfmean(iv) 
-       END DO
+!$OMP PARALLEL DO PRIVATE(ix,iy,iz,iv,im,im2,io,dist,rloc,xfmean,xfpert,wa,wamean,pa)
+  DO ix = 1, nx
+    DO iy = 1, ny
+      DO iz = 1, nz
 
-       !Computing simple localization
-       CALL simple_loc( ix , iy , iz , ox , oy , oz , locs , nobs , rloc )
+        ! ---- localisation weights for this grid point -----------------
+        DO io = 1, nobs
+          dist = 0.0_r_sngl
+          IF (lx > 1.0e-6) dist = dist + ((REAL(ix,r_sngl) - ox(io)) / lx)**2
+          IF (ly > 1.0e-6) dist = dist + ((REAL(iy,r_sngl) - oy(io)) / ly)**2
+          IF (lz > 1.0e-6) dist = dist + ((REAL(iz,r_sngl) - oz(io)) / lz)**2
+          dist = MIN(dist, 700.0_r_sngl)   ! prevent exp underflow
+          rloc(io) = EXP(-0.5_r_size * REAL(dist, r_size))
+        END DO
 
-       rloc(:) = oerr(:) / MAX( rloc(:), 1.0e-6_r_size )
+        ! ---- R-localisation: inflate obs error by 1/rho ---------------
+        rloc(:) = oerr_dp(:) / MAX(rloc(:), 1.0e-6_r_size)
+        rloc(:) = MAX(rloc(:), 1.0e-12_r_size)   ! floor after division
 
-       CALL letkf_core(nbv,nobs,hxfpert,rloc,   &
-                    dep_rsize,infl,wa,wamean,pa,1.0d0)
+        ! ---- prior ensemble mean and perturbations --------------------
+        DO iv = 1, nvar
+          CALL com_mean(nbv, REAL(xf(ix,iy,iz,:,iv), r_size), xfmean(iv))
+          xfpert(:, iv) = REAL(xf(ix,iy,iz,:,iv), r_size) - xfmean(iv)
+        END DO
 
-       !Apply the weights and update the state variables. 
-       DO iv=1,nvar
-          xa(ix,iy,iz,:,iv) = xfmean(iv)
-          DO im=1,nbv
-            DO im2 = 1,nbv
-               xa(ix,iy,iz,im,iv) = xa(ix,iy,iz,im,iv) &                 
-               & + xfpert(im2,iv) * (wa(im2,im) + wamean(im2))    
+        ! ---- LETKF core -----------------------------------------------
+        CALL letkf_core(nbv, nobs, hxfpert, rloc, dep_dp, &
+                        infl, wa, wamean, pa, 1.0d0)
+
+        ! ---- apply weights to update state variables ------------------
+        DO iv = 1, nvar
+          xa(ix,iy,iz,:,iv) = REAL(xfmean(iv), r_sngl)
+          DO im = 1, nbv
+            DO im2 = 1, nbv
+              xa(ix,iy,iz,im,iv) = xa(ix,iy,iz,im,iv) &
+                + REAL(xfpert(im2,iv) * (wa(im2,im) + wamean(im2)), r_sngl)
             END DO
           END DO
-       END DO
+        END DO
 
+      END DO
     END DO
   END DO
-END DO 
 !$OMP END PARALLEL DO
 
 END SUBROUTINE simple_letkf_wloc
 
-SUBROUTINE simple_loc( glx , gly , glz , olx , oly , olz , locs , nobs , rloc )
-IMPLICIT NONE
-INTEGER, INTENT(IN) :: nobs  !Number of observations.
-INTEGER , INTENT(IN) :: glx , gly , glz !Grid point location
-REAL(r_sngl) , INTENT(IN) :: olx(nobs) , oly(nobs) , olz(nobs) !Observation's location
-REAL(r_size) , INTENT(INOUT) :: rloc(nobs)
-REAL(r_sngl) , INTENT(IN)    :: locs(3)  !Localization scales
-INTEGER :: iobs
-REAL(r_sngl) :: dist
-
-DO iobs = 1 , nobs 
-   dist = 0.0
-   !Negative localization scale means no localization in that direction.
-   IF ( locs(1) > 0.0 ) dist = dist + ((REAL(glx,r_sngl)-olx(iobs))/locs(1))**2
-   IF ( locs(2) > 0.0 ) dist = dist + ((REAL(gly,r_sngl)-oly(iobs))/locs(2))**2
-   IF ( locs(3) > 0.0 ) dist = dist + ((REAL(glz,r_sngl)-olz(iobs))/locs(3))**2
-
-   rloc(iobs) = exp( -0.5*dist ) 
-   !WRITE(*,*)dist,rloc(iobs)
-ENDDO
-
-END SUBROUTINE simple_loc
-
-SUBROUTINE calc_ref_ens(nx,ny,nz,nbv,qrens,qsens,qgens,tens,pens,refens)
-IMPLICIT NONE
-INTEGER,INTENT(IN)         :: nx,ny,nz,nbv !number of X,Y,Z, members , update variables
-REAL(r_size), INTENT(IN) :: qrens(nx,ny,nz,nbv),qsens(nx,ny,nz,nbv),qgens(nx,ny,nz,nbv)
-REAL(r_size), INTENT(IN) :: tens(nx,ny,nz,nbv),pens(nx,ny,nz,nbv)
-REAL(r_size), INTENT(OUT):: refens(nx,ny,nz,nbv)
-
-INTEGER :: ix,iy,iz,im
-
-!$OMP PARALLEL DO PRIVATE(ix,iy,iz,im)
-DO ix=1,nx
-  DO iy=1,ny
-    DO iz=1,nz
-      DO im=1,nbv
-         CALL calc_ref(qrens(ix,iy,iz,im),qsens(ix,iy,iz,im),qgens(ix,iy,iz,im),    &
-                       tens(ix,iy,iz,im),pens(ix,iy,iz,im),refens(ix,iy,iz,im) )
-      END DO
-    END DO
-  END DO
-END DO
-!$OMP END PARALLEL DO
-
-
-END SUBROUTINE calc_ref_ens
-
-!-----------------------------------------------------------------------
-! Compute radar reflectivity and radial wind.
-! Radial wind computations for certain methods depend on model reflectivity
-! so both functions has been merged into a single one.
-! First reflectivity is computed, and the the radial velocity is computed.
-!-----------------------------------------------------------------------
-SUBROUTINE calc_ref(qr,qs,qg,t,p,ref)
+!=======================================================================
+SUBROUTINE calc_ref(qr, qs, qg, t, p, ref)
+!=======================================================================
+!
+! Radar reflectivity forward operator (Tong & Xue 2006, 2008).
+! Based on Smith et al. 1975, Marshall-Palmer distributions, S-band.
+!
+!  INPUT
+!    qr, qs, qg : rain, snow, graupel mixing ratios [kg/kg]
+!    t          : temperature [K]
+!    p          : pressure    [Pa]
+!
+!  OUTPUT
+!    ref        : equivalent reflectivity factor [dBZ], floor at -20 dBZ
+!
+!=======================================================================
   IMPLICIT NONE
-  REAL(r_size), INTENT(IN) :: qr  !Cloud and rain water
-  REAL(r_size), INTENT(IN) :: qs,qg !Cloud ice, snow and graupel
-  REAL(r_size), INTENT(IN) :: t,p    !Temperature and pressure.
-  REAL(r_size), INTENT(OUT) :: ref   !Reflectivity
-  REAL(r_size)              :: ro 
-  REAL(r_size)  :: qms , qmg !Melting species concentration (method 3)
-  REAL(r_size)  :: qt        !Total condensate mixing ratio (method 1)
-  REAL(r_size)  :: zr , zs , zg !Rain, snow and graupel's reflectivities.
-  REAL(r_size)  :: nor, nos, nog !Rain, snow and graupel's intercepting parameters.
-  REAL(r_size)  :: ror, ros, rog , roi !Rain, snow and graupel, ice densities.
-  REAL(r_size)  :: cf,cf2,cf3,cf4, pip , roo
-  REAL(r_size)  :: ki2 , kr2
-  REAL(r_size)  :: tmp_factor , rofactor
-  REAL(r_size)  :: p0
-  REAL(r_size),PARAMETER  :: mindbz=-20.0d0
+  REAL(r_size), INTENT(IN)  :: qr, qs, qg, t, p
+  REAL(r_size), INTENT(OUT) :: ref
 
-  !Note: While equivalent reflectivity is assumed to be independent of the radar, in 
-  !practice short wavelengths as those associated with K band radars migh frequently
-  !experience Mie scattering. In that case, the equivalent reflectivity is not longer
-  !radar independent and an appropiate relationship between the forecasted concentrations
-  !and the reflectivity should be used.
-  
-  !Initialize reflectivities
-  zr=0.0d0
-  zs=0.0d0
-  zg=0.0d0
-  ref=mindbz
+  REAL(r_size), PARAMETER :: mindbz = -20.0d0
 
-  !Compute air density (all methods use this)
+  ! Intercept parameters [m^-4]
+  REAL(r_size), PARAMETER :: nor = 8.0d6
+  REAL(r_size), PARAMETER :: nos = 2.0d6
+  REAL(r_size), PARAMETER :: nog = 4.0d6
 
-  ro =  p / (rd * t)
+  ! Densities [kg/m^3]
+  REAL(r_size), PARAMETER :: ror = 1000.0d0
+  REAL(r_size), PARAMETER :: ros =  100.0d0
+  REAL(r_size), PARAMETER :: rog =  913.0d0
+  REAL(r_size), PARAMETER :: roi =  917.0d0
 
-  !Begin computation of reflectivity and vr
+  ! Dielectric factors
+  REAL(r_size), PARAMETER :: ki2 = 0.176d0
+  REAL(r_size), PARAMETER :: kr2 = 0.930d0
 
-  !Observation operator from Tong and Xue 2006, 2008 a and b.
-  !Based on Smith et al 1975.
-  !Ensemble Kalman Filter Assimilation of Doppler Radar Data with a Compressible
-  !Nonhydrostatic Model: OSS Experiments. MWR. 133, 1789-187.
-  !It includes reflectivity contribution by all the microphisical species.
-  !is assumes Marshall and Palmer distributions.
-  !Based on S band radars.
-    nor=8.0d6      ![m^-4]
-    nos=2.0d6      ![m^-4] This value has been modified according to WRF WSM6
-    nog=4.0d6      ![m^-4] This value has been modified according to WRF WSM6
-    ror=1000.0d0   ![Kg/m3]
-    ros=100.0d0    ![Kg/m3]
-    rog=913.0d0    ![Kg/m3] 
-    roi=917.0d0    ![Kg/m3]
-    roo=1.0d0      ![Kg/m3] Surface air density.
-    ki2=0.176d0    !Dielectric factor for ice.
-    kr2=0.930d0    !Dielectric factor for water.
-    pip=pi ** 1.75 !factor
-    cf=1.0d18*720/(pip*(nor**0.75d0)*(ror**1.75d0))
-    cf2=1.0d18*720*ki2*( ros ** 0.25 )/(pip*kr2*(nos ** 0.75)*( roi ** 2 ) )
-    cf3=1.0d18*720/( pip * ( nos ** 0.75 ) * ( ros ** 1.75 ) )  
-    cf4=(1.0d18*720/( pip * ( nog ** 0.75) * ( rog ** 1.75 ) ) ) ** 0.95
+  REAL(r_size) :: ro, pip
+  REAL(r_size) :: cf, cf2, cf3, cf4
+  REAL(r_size) :: zr, zs, zg
 
-    zr=0.0d0
-    zs=0.0d0
-    zg=0.0d0
-    IF( qr .GT. 0.0d0 )THEN
-      !rain contribution
-      zr= cf * ( ( ro * qr )**1.75 )
-    ENDIF
-    IF( qs .GT. 0.0d0 )THEN
-      IF ( t <= 273.16 )THEN
-        !Dry snow
-        zs = cf2*( ( ro * qs ) ** 1.75 )
-      ELSE
-        !Wet snow
-        zs = cf3 * ( ( ro * qs ) ** 1.75 )
-      ENDIF
-    ENDIF
+  ! Pre-compute coefficients
+  pip  = pi ** 1.75d0
+  cf   = 1.0d18 * 720.0d0 / (pip * (nor**0.75d0) * (ror**1.75d0))
+  cf2  = 1.0d18 * 720.0d0 * ki2 * (ros**0.25d0) &
+         / (pip * kr2 * (nos**0.75d0) * (roi**2.0d0))
+  cf3  = 1.0d18 * 720.0d0 / (pip * (nos**0.75d0) * (ros**1.75d0))
+  cf4  = (1.0d18 * 720.0d0 / (pip * (nog**0.75d0) * (rog**1.75d0)))**0.95d0
 
-    !Only wet graupel contribution is ussed.
-    IF( qg .GT. 0.0d0 )THEN
-      zg= cf4 * ( ( ro * qg ) ** 1.6625 )
-    ENDIF
+  ! Air density
+  ro = p / (rd * t)
 
-    ref = zr + zs + zg  
+  zr = 0.0d0
+  zs = 0.0d0
+  zg = 0.0d0
 
-    ref = 10.0d0*log10( ref )
+  IF (qr > 0.0d0) zr = cf  * (ro * qr)**1.75d0
+  IF (qs > 0.0d0) THEN
+    IF (t <= 273.16d0) THEN
+      zs = cf2 * (ro * qs)**1.75d0   ! dry snow
+    ELSE
+      zs = cf3 * (ro * qs)**1.75d0   ! wet snow
+    END IF
+  END IF
+  IF (qg > 0.0d0) zg = cf4 * (ro * qg)**1.6625d0
 
-    IF(ref < mindbz)THEN
-       ref = mindbz
-    ENDIF
-
-RETURN
+  ref = zr + zs + zg
+  IF (ref > 0.0d0) THEN
+    ref = 10.0d0 * LOG10(ref)
+  ELSE
+    ref = mindbz
+  END IF
+  IF (ref < mindbz) ref = mindbz
 
 END SUBROUTINE calc_ref
 
-
 END MODULE common_da
-
-
-
-

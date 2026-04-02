@@ -1,11 +1,11 @@
 name: wrf_python_assimilation
 channels:
+  - defaults
   - conda-forge
 dependencies:
-  - python=3.11
-  - numpy<2
+  - python
+  - numpy
   - setuptools
-  - wheel
   - numpy
   - scipy
   - netcdf4
@@ -17,11 +17,6 @@ dependencies:
   - tqdm
   - jupyter
   - ipykernel
-  - compilers
-  - fortran-compiler
-  - threadpoolctl
   - pip
-  - pip:
-      - snakeviz
-      - line_profiler
-      - scalene
+
+

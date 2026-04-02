@@ -1,0 +1,2 @@
+{'real': {'r_size': 'double', 'r_dble': 'double', 'r_sngl': 'float'},
+ 'integer': {}}

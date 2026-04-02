@@ -1,7 +1,7 @@
 import os, sys
 import numpy as np
 
-# ── Verbosity 
+#### Verbosity 
 # 0=silent  1=method start/finish  2=per-step  3=debug
 # Set once per process with set_verbose(level).
 
@@ -95,6 +95,54 @@ def compute_hxf(xf_grid: np.ndarray,
                 xf_grid[i, j, k, m, var_idx["P"]],
             )
     return hxf
+
+
+def compute_loc_weights(nx: int, ny: int, nz: int,
+                        i0: int, j0: int, k0: int,
+                        locs: np.ndarray) -> np.ndarray:
+    """
+    Compute Gaussian localization weight field centered on obs point (i0,j0,k0).
+
+    Uses a compact-support cutoff: points beyond
+        max_dist = 2 * sqrt(10/3) * max(locs[0], locs[1])
+    receive weight NaN (outside radius of influence).
+
+    Inside the cutoff:
+        rho(i,j,k) = exp(-0.5 * [((i-i0)/lx)^2 + ((j-j0)/ly)^2 + ((k-k0)/lz)^2])
+
+    Axes with locs <= 0 are ignored (no localization in that direction).
+
+    Parameters
+    ----------
+    nx, ny, nz : domain dimensions
+    i0, j0, k0 : obs grid location (0-based)
+    locs       : (3,) array [lx, ly, lz] in grid-point units
+
+    Returns
+    -------
+    rloc : (nx, ny, nz) float32
+        NaN outside cutoff, Gaussian weight inside.
+    """
+    lx, ly, lz = float(locs[0]), float(locs[1]), float(locs[2])
+
+    # compact-support cutoff in grid-point units (horizontal only, as in advisor's code)
+    max_dist = 2.0 * (10.0 / 3.0) ** 0.5 * max(lx if lx > 0 else 0.0,
+                                                  ly if ly > 0 else 0.0)
+
+    ii = np.arange(nx, dtype=np.float32)
+    jj = np.arange(ny, dtype=np.float32)
+    kk = np.arange(nz, dtype=np.float32)
+
+    dist = np.zeros((nx, ny, nz), dtype=np.float32)
+    if lx > 0.0:
+        dist += ((ii - i0) / lx)[:, np.newaxis, np.newaxis] ** 2
+    if ly > 0.0:
+        dist += ((jj - j0) / ly)[np.newaxis, :, np.newaxis] ** 2
+    if lz > 0.0:
+        dist += ((kk - k0) / lz)[np.newaxis, np.newaxis, :] ** 2
+
+    rloc = np.where(dist <= max_dist, np.exp(-0.5 * dist), np.nan).astype(np.float32)
+    return rloc
 
 
 def aoei(yo: np.ndarray,
@@ -278,7 +326,7 @@ def atenkf_update(xf_grid, yo, obs_error_var, ox, oy, oz, loc_scales, var_idx,
                 alpha_weights=steps, obs_error_raw=R0)
 
 
-# ── ATEnKF helpers ─────────────────────────────────────────────────────────
+#### ATEnKF helpers #########################################################
 
 def _solve_ntemp(inflation_ratio: float,
                  alpha_s: float,

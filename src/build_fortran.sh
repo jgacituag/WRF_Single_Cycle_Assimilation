@@ -1,35 +1,69 @@
 #!/usr/bin/env bash
-# scripts/build_fortran.sh
-# Build the cletkf_wloc Fortran module with f2py + OpenMP.
+# src/build_fortran.sh
+# ====================
+# Build the cletkf_wloc Fortran/f2py extension.
+#
+# Dependencies (all inside the active conda environment):
+#   gfortran, f2py (numpy), LAPACK, OpenBLAS/BLAS
+#
+# Usage:
+#   conda activate <your_env>
+#   bash src/build_fortran.sh
+#
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$HERE/.." && pwd)"
-SRC_DIR="$ROOT/src/fortran"
+SRC_DIR="$HERE/fortran"
+
+# ---- locate conda LAPACK/BLAS libraries --------------------------------
+if [[ -z "${CONDA_PREFIX:-}" ]]; then
+  echo "[ERROR] CONDA_PREFIX not set — activate your conda environment first."
+  exit 1
+fi
+
+CONDA_LIB="$CONDA_PREFIX/lib"
+
+if [[ ! -f "$CONDA_LIB/liblapack.so" && ! -f "$CONDA_LIB/liblapack.dylib" ]]; then
+  echo "[WARN] liblapack not found in $CONDA_LIB"
+  echo "       Try: conda install -c conda-forge lapack"
+fi
+
+# ---- sources -----------------------------------------------------------
+SOURCES="common_tools.f90 common_mtx.f90 common_letkf.f90 common_da_wloc.f90"
+MODNAME="cletkf_wloc"
 
 cd "$SRC_DIR"
-rm -f *.mod *.so
-# Ensure sources exist
-for f in netlib.f90 SFMT.f90 common_tools.f90 common_mtx.f90 common_letkf.f90 common_da_wloc.f90; do
+rm -f *.mod *.so "${MODNAME}"*.so
+
+echo "[build] Checking sources..."
+for f in $SOURCES; do
   if [[ ! -f $f ]]; then
     echo "[ERROR] Missing $f in $SRC_DIR"
     exit 1
   fi
+  echo "        found $f"
 done
 
-F2PY=f2py
-MODNAME="cletkf_wloc"
-FFLAGS='-O3'
-#export FC=gfortran
-#export F90=gfortran
-echo "[build] Sources: SFMT.f90 common_tools.f90 common_mtx.f90 common_letkf.f90 common_da_wloc.f90"
-#$F2PY -c -lgomp --opt="-fopenmp -lgomp" netlib.f90 SFMT.f90 common_tools.f90 common_mtx.f90 common_letkf.f90 common_da_wloc.f90 -m cletkf_wloc
-#$F2PY -c -lgomp --opt="-fopenmp -lgomp" netlib.f90 SFMT.f90 common_tools.f90 common_mtx.f90 common_letkf.f90 common_da.f90 -m cletkf > compile_cletkf.out 2>&1
-$F2PY -c -lgomp --opt="-fopenmp -lgomp" netlib.f90 SFMT.f90 common_tools.f90 common_mtx.f90 common_letkf.f90 common_da_wloc.f90 -m cletkf_wloc > compile_cletkf_wloc.out 2>&1
+# ---- set library path so linker and runtime can find liblapack ---------
+export LDFLAGS="-L${CONDA_LIB} -Wl,-rpath,${CONDA_LIB}"
 
-SOFILE=$(ls ${MODNAME}*.so | head -n1 || true)
+echo "[build] Building $MODNAME ..."
+echo "[build] CONDA_LIB=$CONDA_LIB"
+
+f2py -c \
+  --opt="-O3 -fopenmp" \
+  --f90flags="-O3 -fopenmp" \
+  -lgomp \
+  -llapack \
+  -L"$CONDA_LIB" \
+  $SOURCES \
+  -m "$MODNAME" \
+  2>&1 | tee compile_cletkf_wloc.out
+
+SOFILE=$(ls ${MODNAME}*.so 2>/dev/null | head -n1 || true)
 if [[ -n "${SOFILE}" ]]; then
-  echo "[build] Installed: $SRC_DIR/${SOFILE}"
+  echo "[build] Success: $SRC_DIR/${SOFILE}"
 else
-  echo "[warn] Build finished but .so not found."
+  echo "[ERROR] Build failed — see $SRC_DIR/compile_cletkf_wloc.out"
+  exit 1
 fi

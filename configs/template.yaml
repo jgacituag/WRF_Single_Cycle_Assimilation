@@ -50,19 +50,22 @@ obs:
 #### quality control #######################################################
 qc:
   # Skip points where the ensemble mean in obs space is below dbz_min.
-  # Physical motivation: no signal in observation space -> no correction possible.
-  filter_ensemble: true     # recommended: always true
+  filter_ensemble: true     
+
+  # Skip points where ALL ensemble members in obs space are below dbz_min.
+  # Stricter than filter_ensemble (mean-based): requires every single member
+  # to show no signal before discarding the point.
+  filter_ensemble_all: false
 
   # Skip points where the truth (yo) is below dbz_min.
-  # Optional: isolates the nonlinear regime where the ensemble underestimates.
   filter_truth: false
 
-  # How to combine filter_ensemble and filter_truth when both are true:
-  #   "and"  skip only if BOTH conditions fail  (less aggressive filtering)
-  #   "or"   skip if EITHER condition fails     (more aggressive filtering)
+  # How to combine active filters:
+  #   "and"  skip only if ALL active filters fail  (less aggressive, default)
+  #   "or"   skip if ANY active filter fails       (more aggressive)
   filter_mode: and
 
-  # Reflectivity threshold [dBZ] used by both filters above
+  # Reflectivity threshold [dBZ] used by all filters
   dbz_min: 5.0
 
 #### sweep #################################################################

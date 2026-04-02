@@ -124,7 +124,7 @@ Set `loc_x/y/z: 99999` (or `null`) to disable localization on an axis.
 Before any full run, verify all methods work correctly on a single point:
 
 ```bash
-python tests/run_sanity_check.py --config configs/ws2.yaml \
+python test/run_sanity_check.py --config configs/test_sanity.yaml \
     --truth 0 --x 10 --y 0 --z 15
 ```
 

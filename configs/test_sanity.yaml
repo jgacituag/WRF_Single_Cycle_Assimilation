@@ -10,7 +10,7 @@
 # The obs point (--x, --y, --z) defaults to 0,0,0 — choose a point
 # with non-zero reflectivity for a meaningful check (use Notebook 1
 # or the obs_explorer notebook to find good candidates).
-
+verbose: 3
 paths:
   prepared: "/home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation/data/3D_subsets_20240319_DAFCST_20240319180000/subset_20240320180000.npz"
 
