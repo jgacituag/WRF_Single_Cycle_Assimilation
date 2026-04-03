@@ -139,6 +139,53 @@ SUBROUTINE simple_letkf_wloc(nx, ny, nz, nbv, nvar, nobs, &
 END SUBROUTINE simple_letkf_wloc
 
 !=======================================================================
+SUBROUTINE calc_ref_ens(nx, ny, nz, nbv, qr, qs, qg, t, p, ref)
+!=======================================================================
+!
+! Compute radar reflectivity for the full ensemble over the 3D domain.
+! Vectorised wrapper around calc_ref — avoids per-point Python loop.
+!
+!  INPUT
+!    nx, ny, nz : domain dimensions
+!    nbv        : ensemble size (0 for single-member call)
+!    qr(nx,ny,nz,nbv) : rain    mixing ratio [kg/kg]
+!    qs(nx,ny,nz,nbv) : snow    mixing ratio [kg/kg]
+!    qg(nx,ny,nz,nbv) : graupel mixing ratio [kg/kg]
+!    t (nx,ny,nz,nbv) : temperature [K]
+!    p (nx,ny,nz,nbv) : pressure    [Pa]
+!
+!  OUTPUT
+!    ref(nx,ny,nz,nbv) : reflectivity [dBZ]
+!
+!=======================================================================
+  IMPLICIT NONE
+  INTEGER,      INTENT(IN)  :: nx, ny, nz, nbv
+  REAL(r_size), INTENT(IN)  :: qr(nx,ny,nz,nbv)
+  REAL(r_size), INTENT(IN)  :: qs(nx,ny,nz,nbv)
+  REAL(r_size), INTENT(IN)  :: qg(nx,ny,nz,nbv)
+  REAL(r_size), INTENT(IN)  :: t (nx,ny,nz,nbv)
+  REAL(r_size), INTENT(IN)  :: p (nx,ny,nz,nbv)
+  REAL(r_size), INTENT(OUT) :: ref(nx,ny,nz,nbv)
+
+  INTEGER :: ix, iy, iz, im
+
+!$OMP PARALLEL DO PRIVATE(ix,iy,iz,im)
+  DO ix = 1, nx
+    DO iy = 1, ny
+      DO iz = 1, nz
+        DO im = 1, nbv
+          CALL calc_ref(qr(ix,iy,iz,im), qs(ix,iy,iz,im), &
+                        qg(ix,iy,iz,im), t (ix,iy,iz,im), &
+                        p (ix,iy,iz,im), ref(ix,iy,iz,im))
+        END DO
+      END DO
+    END DO
+  END DO
+!$OMP END PARALLEL DO
+
+END SUBROUTINE calc_ref_ens
+
+!=======================================================================
 SUBROUTINE calc_ref(qr, qs, qg, t, p, ref)
 !=======================================================================
 !

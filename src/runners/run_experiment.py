@@ -25,27 +25,10 @@ Sweep dimensions (all support scalar, list, or {start, stop, num})
 
 Output files
 ------------
-  Single-obs (mode: single or full_grid):
-    One file per (combo, truth_member).  Each file is a table where every
-    key is a 1-D array of length N_obs (number of QC-passing obs points).
-    Row i corresponds to the experiment where point (obs_x[i], obs_y[i],
-    obs_z[i]) was the single assimilated observation.  The prior ensemble
-    is the same for all rows in a file.
-
-    Filename: {tag}_{method}_Nt{nt}_as{as}_Lx{lx}Ly{ly}Lz{lz}_Ne{ne}_qc{qc}_True{tm}.npz
-
-    Keys stored: obs_x, obs_y, obs_z, yo, hxf_mean_obs, hxa_mean_obs,
-      dep_b, dep_a, spread_f_obs, spread_a_obs, inc_obs,
-      loc_weights_sum, n_updated,
-      rmse_{f,a}_{w,u}_{var}, bias_{f,a}_{w,u}_{var},
-      spread_{f,a}_{w,u}_{var},  xf_mean_{var}, xa_mean_{var}, truth_{var},
-      rmse_{f,a}_obs_{w,u}, bias_{f,a}_obs_{w,u}
-
-  Multi-obs (mode: strided or all):
-    One file per (combo, truth_member). Stores full xf, xa matrices plus
-    global scalar and (nx,ny,nz) field metrics.
-
-    Filename: {tag}_{method}_Nt{nt}_as{as}_Lx{lx}Ly{ly}Lz{lz}_Ne{ne}_str{stride}_qc{qc}_True{tm}.npz
+  Single-obs:
+    {tag}_{method}_Nt{nt}_as{as}_Lx{lx}Ly{ly}Lz{lz}_Ne{ne}_obs{x}_{y}_{z}_qc{qc}_True{tm}.npz
+  Multi-obs:
+    {tag}_{method}_Nt{nt}_as{as}_Lx{lx}Ly{ly}Lz{lz}_Ne{ne}_str{stride}_qc{qc}_True{tm}.npz
 
   Config copy: {outdir}/{tag}_config.yaml  (written before any results)
 """
@@ -70,13 +53,10 @@ import da.core as core
 from da.core import (
     letkf_update, tenkf_update, aoei_update,
     atenkf_update, taoei_update,
-    compute_loc_weights,
 )
-from da.metrics import (compute_single_obs_metrics, compute_multi_obs_metrics,
-                        _hx_domain, _hx_domain_truth)
 
 
-##### sweep parameter helpers ################################################
+# ## sweep parameter helpers ################################################
 
 def _expand(val, is_int=False):
     """
@@ -138,41 +118,43 @@ def _qc_pass(yo_val, hxf_mean_val, qc_cfg):
     return not fail_e if fe else not fail_t
 
 
-##### observation operator ###################################################
+# ## observation operator ###################################################
 
 def _calc_hx_domain(state_nvar, var_idx):
     """
-    Compute reflectivity for a (nx,ny,nz,nvar) or (nx,ny,nz,Ne,nvar) array.
-    Returns same shape without nvar axis.
+    Compute reflectivity H(x) over the full 3D domain using the
+    vectorised Fortran calc_ref_ens — one call instead of nx*ny*nz loops.
+
+    state_nvar : (nx,ny,nz,nvar)       single member
+               | (nx,ny,nz,Ne,nvar)    ensemble
+    Returns    : (nx,ny,nz)            or (nx,ny,nz,Ne)  float32
     """
     from cletkf_wloc import common_da as cda
-    vi = var_idx
-    shape = state_nvar.shape
-    if state_nvar.ndim == 4:            ##single member (nx,ny,nz,nvar)
-        nx, ny, nz = shape[:3]
-        out = np.full((nx, ny, nz), np.nan, np.float32)
-        for i in range(nx):
-            for j in range(ny):
-                for k in range(nz):
-                    out[i,j,k] = cda.calc_ref(
-                        state_nvar[i,j,k,vi["qr"]], state_nvar[i,j,k,vi["qs"]],
-                        state_nvar[i,j,k,vi["qg"]], state_nvar[i,j,k,vi["T"]],
-                        state_nvar[i,j,k,vi["P"]],
-                    )
-        return out
-    else:                               ##ensemble (nx,ny,nz,Ne,nvar)
-        nx, ny, nz, Ne = shape[:4]
-        out = np.full((nx, ny, nz, Ne), np.nan, np.float32)
-        for i in range(nx):
-            for j in range(ny):
-                for k in range(nz):
-                    for m in range(Ne):
-                        out[i,j,k,m] = cda.calc_ref(
-                            state_nvar[i,j,k,m,vi["qr"]], state_nvar[i,j,k,m,vi["qs"]],
-                            state_nvar[i,j,k,m,vi["qg"]], state_nvar[i,j,k,m,vi["T"]],
-                            state_nvar[i,j,k,m,vi["P"]],
-                        )
-        return out
+    vi   = var_idx
+    ndim = state_nvar.ndim
+
+    if ndim == 4:                          # single member (nx,ny,nz,nvar)
+        nx, ny, nz, _ = state_nvar.shape
+        # wrap as nbv=1 ensemble, call, then squeeze
+        s = state_nvar[:, :, :, np.newaxis, :]   # (nx,ny,nz,1,nvar)
+        ref = cda.calc_ref_ens(
+            s[:,:,:,:,vi["qr"]].astype(np.float64),
+            s[:,:,:,:,vi["qs"]].astype(np.float64),
+            s[:,:,:,:,vi["qg"]].astype(np.float64),
+            s[:,:,:,:,vi["T"] ].astype(np.float64),
+            s[:,:,:,:,vi["P"] ].astype(np.float64),
+        )                                  # (nx,ny,nz,1)
+        return ref[:, :, :, 0].astype(np.float32)
+
+    else:                                  # ensemble (nx,ny,nz,Ne,nvar)
+        ref = cda.calc_ref_ens(
+            state_nvar[:,:,:,:,vi["qr"]].astype(np.float64),
+            state_nvar[:,:,:,:,vi["qs"]].astype(np.float64),
+            state_nvar[:,:,:,:,vi["qg"]].astype(np.float64),
+            state_nvar[:,:,:,:,vi["T"] ].astype(np.float64),
+            state_nvar[:,:,:,:,vi["P"] ].astype(np.float64),
+        )                                  # (nx,ny,nz,Ne)
+        return ref.astype(np.float32)
 
 
 def _hx_point(state_nvar, i, j, k, var_idx):
@@ -189,7 +171,7 @@ def _hx_point(state_nvar, i, j, k, var_idx):
                      for m in range(state_nvar.shape[0])], np.float32)
 
 
-##### method dispatcher ######################################################
+# ## method dispatcher ######################################################
 
 def _run_method(method, xf, yo, R0, ox, oy, oz, loc_scales, var_idx, ntemp, alpha_s):
     if method == "LETKF":
@@ -208,7 +190,7 @@ def _run_method(method, xf, yo, R0, ox, oy, oz, loc_scales, var_idx, ntemp, alph
     raise ValueError(f"Unknown method: {method}")
 
 
-##### filename builders ######################################################
+# ## filename builders ######################################################
 
 def _fmt(v):
     """Format a float for filenames: no trailing zeros."""
@@ -246,10 +228,11 @@ def _select_prior(ens, tm, prior_size=None):
     return truth, xf, len(all_others)
 
 
-def _fname_single(tag, method, ntemp, alpha_s, lx, ly, lz, ne, qc, tm):
+def _fname_single(tag, method, ntemp, alpha_s, lx, ly, lz,
+                  ne, ox, oy, oz, qc, tm):
     return (f"{tag}_{method}_Nt{ntemp:02d}_as{_fmt(alpha_s)}"
             f"_Lx{_fmt(lx)}Ly{_fmt(ly)}Lz{_fmt(lz)}"
-            f"_Ne{ne:03d}_qc{qc}_True{tm:02d}.npz")
+            f"_Ne{ne:03d}_obs{ox}_{oy}_{oz}_qc{qc}_True{tm:02d}.npz")
 
 
 def _fname_multi(tag, method, ntemp, alpha_s, lx, ly, lz,
@@ -259,7 +242,7 @@ def _fname_multi(tag, method, ntemp, alpha_s, lx, ly, lz,
             f"_Ne{ne:03d}_str{stride_str}_qc{qc}_True{tm:02d}.npz")
 
 
-##### per-truth-member worker ################################################
+# ## per-truth-member worker ################################################
 
 def _worker(args):
     (tm, ens, cfg, verbose) = args
@@ -275,16 +258,13 @@ def _worker(args):
 
     obs_cfg  = sweep["obs_points"]
     if isinstance(obs_cfg, str):
-        obs_mode = obs_cfg
+        obs_mode = obs_cfg           # "full_grid" or "all"
         obs_loc  = None
         stride   = 1
     elif isinstance(obs_cfg, dict):
         obs_mode = obs_cfg.get("mode", "single")
-        obs_loc  = obs_cfg.get("loc", None)
-        stride   = int(obs_cfg.get("stride", 2))
-
-    ## single and full_grid are both single-obs modes (differ only in which points are iterated); strided and all are multi-obs modes.
-    is_single_obs = obs_mode in ("single", "full_grid")
+        obs_loc  = obs_cfg.get("loc", None)      # {x,y,z} for single
+        stride   = int(obs_cfg.get("stride", 2)) # for strided
 
     methods     = _expand(sweep.get("methods",    ["LETKF"]))
     ntemps      = _expand(sweep.get("ntemp",      [1]), is_int=True)
@@ -295,177 +275,150 @@ def _worker(args):
     prior_sizes = _expand(sweep["prior_size"], is_int=True) \
                   if sweep.get("prior_size") is not None else [None]
 
-    ## variable names in index order (needed for per-variable metric keys)
-    var_idx_inv = {v: k for k, v in var_idx.items()}
-    var_names   = [var_idx_inv[i] for i in range(len(var_idx))]
-
-    truth_base = ens[:, :, :, tm, :]           ##(nx, ny, nz, nvar)
-    truth_hx   = _calc_hx_domain(truth_base, var_idx)   ##(nx,ny,nz)
-    nx, ny, nz = truth_base.shape[:3]
-
+    # ── truth H(x): fixed for this tm across all prior sizes ────────────
     t0 = time.time()
+    truth_base = ens[:, :, :, tm, :]
+    nx, ny, nz = truth_base.shape[:3]
     core._log(1, f"[truth {tm:02d}] start  domain={nx}x{ny}x{nz}"
                  f"  prior_sizes={prior_sizes}  mode={obs_mode}")
 
+    _t = time.time()
+    truth_hx = _calc_hx_domain(truth_base, var_idx)   # (nx,ny,nz)
+    core._log(2, f"  [truth {tm:02d}] H(truth) done  {time.time()-_t:.1f}s"
+                 f"  ({nx*ny*nz} pts)")
+
     combos = list(itertools.product(methods, ntemps, alphas, lxs, lys, lzs))
+    core._log(2, f"  [truth {tm:02d}] {len(combos)} combo(s) to run")
     saved  = []
 
     for prior_size in prior_sizes:
 
+        # ── prior ensemble and its H(x) ─────────────────────────────────
         _, xf, Ne = _select_prior(ens, tm, prior_size)
-        ens_hx    = _calc_hx_domain(xf, var_idx)    ##(nx,ny,nz,Ne)
-        ens_mean  = ens_hx.mean(axis=3)              ##(nx,ny,nz)
 
-        core._log(2, f"  [truth {tm:02d}] Ne={Ne}")
+        _t = time.time()
+        ens_hx   = _calc_hx_domain(xf, var_idx)   # (nx,ny,nz,Ne)
+        ens_mean = ens_hx.mean(axis=3)             # (nx,ny,nz)
+        core._log(2, f"  [truth {tm:02d}] H(xf) Ne={Ne} done  {time.time()-_t:.1f}s"
+                     f"  ({nx*ny*nz*Ne} pts)")
 
-        ##### build the list of QC-passing obs points #####################
+        # ── build QC-passing obs list ────────────────────────────────────
+        _t = time.time()
         if obs_mode == "single":
             i0, j0, k0 = int(obs_loc["x"]), int(obs_loc["y"]), int(obs_loc["z"])
-            qc_pts = [(i0, j0, k0)]
-        elif obs_mode == "full_grid":
-            qc_pts = [
-                (i, j, k)
-                for i in range(nx) for j in range(ny) for k in range(nz)
-                if _qc_pass(truth_hx[i, j, k], ens_mean[i, j, k], qc_cfg)
-            ]
-            core._log(1, f"  [truth {tm:02d}] Ne={Ne}  full_grid: "
-                         f"{len(qc_pts)}/{nx*ny*nz} pts pass QC")
-        else:  ## strided / all - multi-obs
-            s = stride if obs_mode == "strided" else 1
-            qc_pts = [
-                (i, j, k)
-                for i in range(0, nx, s)
-                for j in range(0, ny, s)
-                for k in range(0, nz, s)
-                if _qc_pass(truth_hx[i, j, k], ens_mean[i, j, k], qc_cfg)
-            ]
-            core._log(1, f"  [truth {tm:02d}] Ne={Ne}  {obs_mode}: "
-                         f"{len(qc_pts)}/{nx*ny*nz} pts pass QC")
+            obs_sets = [(
+                np.array([i0], np.int32),
+                np.array([j0], np.int32),
+                np.array([k0], np.int32),
+                np.array([truth_hx[i0,j0,k0]], np.float32),
+                f"{i0}_{j0}_{k0}",
+            )]
+            core._log(2, f"  [truth {tm:02d}] obs: single ({i0},{j0},{k0})"
+                         f"  yo={truth_hx[i0,j0,k0]:.2f} dBZ")
 
-        if not qc_pts:
+        elif obs_mode == "full_grid":
+            obs_sets = []
+            for i in range(nx):
+                for j in range(ny):
+                    for k in range(nz):
+                        if _qc_pass(truth_hx[i,j,k], ens_mean[i,j,k], qc_cfg):
+                            obs_sets.append((
+                                np.array([i], np.int32),
+                                np.array([j], np.int32),
+                                np.array([k], np.int32),
+                                np.array([truth_hx[i,j,k]], np.float32),
+                                f"{i}_{j}_{k}",
+                            ))
+            core._log(1, f"  [truth {tm:02d}] Ne={Ne}  full_grid: "
+                         f"{len(obs_sets)}/{nx*ny*nz} pts pass QC"
+                         f"  ({time.time()-_t:.1f}s)")
+
+        else:  # "strided" or "all"
+            s = stride if obs_mode == "strided" else 1
+            ix, iy, iz, yo_vals = [], [], [], []
+            for i in range(0, nx, s):
+                for j in range(0, ny, s):
+                    for k in range(0, nz, s):
+                        if _qc_pass(truth_hx[i,j,k], ens_mean[i,j,k], qc_cfg):
+                            ix.append(i); iy.append(j); iz.append(k)
+                            yo_vals.append(truth_hx[i,j,k])
+            obs_sets = [(
+                np.array(ix, np.int32),
+                np.array(iy, np.int32),
+                np.array(iz, np.int32),
+                np.array(yo_vals, np.float32),
+                f"str{s}",
+            )]
+            core._log(1, f"  [truth {tm:02d}] Ne={Ne}  {obs_mode}: "
+                         f"{len(ix)}/{nx*ny*nz} pts pass QC"
+                         f"  ({time.time()-_t:.1f}s)")
+
+        if not obs_sets:
             core._log(1, f"  [truth {tm:02d}] Ne={Ne}  no valid obs, skipping")
             continue
 
-        ##### multi-obs: one LETKF call, one output file per combo ########
-        if not is_single_obs:
-            ox_arr = np.array([p[0] for p in qc_pts], np.int32)
-            oy_arr = np.array([p[1] for p in qc_pts], np.int32)
-            oz_arr = np.array([p[2] for p in qc_pts], np.int32)
-            yo_arr = np.array([truth_hx[p[0], p[1], p[2]] for p in qc_pts],
-                               np.float32)
-            R0     = np.full(len(yo_arr), R0_val, np.float32)
-            stride_str = f"{stride}" if obs_mode == "strided" else "all"
+        # ── sweep over parameter combos ──────────────────────────────────
+        for (ox_arr, oy_arr, oz_arr, yo_arr, loc_str) in obs_sets:
+            R0 = np.full(len(yo_arr), R0_val, np.float32)
 
             for (method, ntemp, alpha_s, lx, ly, lz) in combos:
                 loc_scales = np.array([lx, ly, lz], np.float32)
-                fname    = _fname_multi(tag, method, ntemp, alpha_s,
-                                        lx, ly, lz, Ne, stride_str, qc, tm)
+
+                if obs_mode in ("single", "full_grid"):
+                    fname = _fname_single(tag, method, ntemp, alpha_s,
+                                          lx, ly, lz, Ne,
+                                          ox_arr[0], oy_arr[0], oz_arr[0],
+                                          qc, tm)
+                else:
+                    fname = _fname_multi(tag, method, ntemp, alpha_s,
+                                         lx, ly, lz, Ne, loc_str, qc, tm)
+
                 out_path = os.path.join(outdir, fname)
-                if os.path.exists(out_path) and cfg.get("skip_existing", False):
-                    core._log(2, f"  [skip] {fname}")
-                    saved.append(fname)
-                    continue
+                if os.path.exists(out_path):
+                    if cfg.get("skip_existing", False):
+                        core._log(2, f"  [skip] {fname}")
+                        saved.append(fname)
+                        continue
 
                 core._log(2, f"  {method} Ne={Ne} Nt={ntemp} as={alpha_s} "
-                             f"L=[{lx},{ly},{lz}] nobs={len(yo_arr)}")
+                             f"L=[{lx},{ly},{lz}] obs={loc_str}")
 
-                res  = _run_method(method, xf, yo_arr, R0,
-                                   ox_arr, oy_arr, oz_arr,
-                                   loc_scales, var_idx, ntemp, alpha_s)
-                save = compute_multi_obs_metrics(
-                    xf=xf, xa=res["xa"],
-                    truth=truth_base,
-                    yo=yo_arr, ox=ox_arr, oy=oy_arr, oz=oz_arr,
-                    var_idx=var_idx, var_names=var_names,
-                )
-                save["truth_member"] = np.int32(tm)
-                save["Ne"]           = np.int32(Ne)
-                np.savez_compressed(out_path, **save)
-                saved.append(fname)
-            continue   ## next prior_size
-
-        ##### single-obs: iterate over QC-passing points, collect into table
-        ##One output file per combo, containing all obs-point rows.
-        ##################################################################
-        for (method, ntemp, alpha_s, lx, ly, lz) in combos:
-            loc_scales = np.array([lx, ly, lz], np.float32)
-            fname    = _fname_single(tag, method, ntemp, alpha_s,
-                                     lx, ly, lz, Ne, qc, tm)
-            out_path = os.path.join(outdir, fname)
-            if os.path.exists(out_path) and cfg.get("skip_existing", False):
-                core._log(2, f"  [skip] {fname}")
-                saved.append(fname)
-                continue
-
-            core._log(2, f"  {method} Ne={Ne} Nt={ntemp} as={alpha_s} "
-                         f"L=[{lx},{ly},{lz}]  {len(qc_pts)} obs pts")
-
-            ##Precompute fields that are identical for every obs point in
-            ##this combo — xf and truth never change within the loop.
-            hxf_mean_field = _hx_domain(xf, var_idx)           ##(nx,ny,nz)
-            truth_hx_field = _hx_domain_truth(truth_base, var_idx)  ##(nx,ny,nz)
-            xf_mean_state  = xf.mean(axis=3)   ##(nx,ny,nz,nvar) — also invariant
-
-            ##Accumulate one row per obs point into lists, then stack.
-            rows = []
-            obs_x_list, obs_y_list, obs_z_list = [], [], []
-
-            for (i0, j0, k0) in qc_pts:
-                yo_val   = float(truth_hx[i0, j0, k0])
-                ox_arr   = np.array([i0], np.int32)
-                oy_arr   = np.array([j0], np.int32)
-                oz_arr   = np.array([k0], np.int32)
-                yo_arr   = np.array([yo_val], np.float32)
-                R0       = np.array([R0_val],  np.float32)
-
+                _t = time.time()
                 res = _run_method(method, xf, yo_arr, R0,
                                   ox_arr, oy_arr, oz_arr,
                                   loc_scales, var_idx, ntemp, alpha_s)
+                core._log(3, f"    DA done  {time.time()-_t:.2f}s")
 
-                ## localization weight field centred on this obs point
-                rloc = compute_loc_weights(nx, ny, nz, i0, j0, k0, loc_scales)
-
-                ## H(xf) ensemble at the obs point — shape (Ne,)
-                hxf_at_obs = ens_hx[i0, j0, k0, :]    ##(Ne,)
-
-                row = compute_single_obs_metrics(
-                    xf=xf, xa=res["xa"],
-                    truth=truth_base,
-                    rloc=rloc,
-                    hxf_at_obs=hxf_at_obs,
-                    yo=yo_val,
-                    var_idx=var_idx,
-                    var_names=var_names,
-                    hxf_mean_field=hxf_mean_field,
-                    truth_hx_field=truth_hx_field,
+                _t = time.time()
+                hxf_pt = ens_hx[ox_arr, oy_arr, oz_arr, :]  # (nobs, Ne)
+                save = dict(
+                    xa=res["xa"],
+                    yo=yo_arr,
+                    hxf_mean=hxf_pt.mean(axis=1).astype(np.float32),
+                    dep=(yo_arr - hxf_pt.mean(axis=1)).astype(np.float32),
+                    spread=hxf_pt.std(axis=1, ddof=1).astype(np.float32),
+                    obs_error=np.asarray(res.get("obs_error",
+                                         res.get("obs_error_raw", R0)),
+                                         np.float32),
+                    ox=ox_arr, oy=oy_arr, oz=oz_arr,
+                    truth_member=np.int32(tm),
+                    Ne=np.int32(Ne),
                 )
-                rows.append(row)
-                obs_x_list.append(i0)
-                obs_y_list.append(j0)
-                obs_z_list.append(k0)
+                for key in ("xatemp","hxfs","deps","alpha_weights",
+                            "ntemps_per_obs","obs_error_aoei","obs_error_eff"):
+                    if key in res:
+                        save[key] = res[key]
 
-            ##### stack rows into arrays and save ######################
-            save = {
-                "obs_x": np.array(obs_x_list, np.int32),
-                "obs_y": np.array(obs_y_list, np.int32),
-                "obs_z": np.array(obs_z_list, np.int32),
-                "truth_member": np.int32(tm),
-                "Ne": np.int32(Ne),
-            }
-            ## Every key in rows[0] is a scalar stack across obs points
-            for key in rows[0]:
-                save[key] = np.array([r[key] for r in rows], dtype=np.float32)
-
-            np.savez_compressed(out_path, **save)
-            saved.append(fname)
-            core._log(2, f"  -> saved {fname}  ({len(rows)} rows)")
+                np.savez_compressed(out_path, **save)
+                core._log(3, f"    save done  {time.time()-_t:.2f}s  -> {fname}")
+                saved.append(fname)
 
     elapsed = time.time() - t0
     core._log(1, f"[truth {tm:02d}] done  {len(saved)} files  {elapsed:.1f}s")
     return saved
 
 
-##### main ###################################################################
+# ## main ###################################################################
 
 def main():
     ap = argparse.ArgumentParser()
@@ -485,19 +438,19 @@ def main():
 
     os.makedirs(outdir, exist_ok=True)
 
-    ## copy config to output dir before anything else
+    # copy config to output dir before anything else
     config_copy = os.path.join(outdir, f"{tag}_config.yaml")
     shutil.copy2(args.config, config_copy)
     print(f"[info] config saved -> {config_copy}")
 
-    ## expand truth members
+    # expand truth members
     tm_cfg = cfg["sweep"].get("truth_members", "all")
     if tm_cfg == "all":
         truth_members = list(range(n_members))
     else:
         truth_members = _expand(tm_cfg, is_int=True)
 
-    ## load ensemble once in main process
+    # load ensemble once in main process
     data = np.load(cfg["paths"]["prepared"])
     ens  = data["state_ensemble"] if "state_ensemble" in data \
            else data["cross_sections"]

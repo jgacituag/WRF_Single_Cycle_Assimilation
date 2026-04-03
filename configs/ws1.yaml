@@ -1,28 +1,36 @@
 # configs/ws1.yaml
 # ================
-# WS-1: Ntemp sweep
+# WS-1: single observation, Ntemp sensitivity sweep
 #
-# Scientific question: how many tempering iterations are needed in 3D WRF
-# before performance saturates?
+# Scientific question: how many tempering iterations are needed before
+# performance saturates? Compare LETKF baseline vs TEnKF for Ntemp=1..N
 #
 # Design:
-#   - Single observation at a fixed grid location
-#   - Methods: LETKF (baseline, Ntemp=1) and TEnKF for Ntemp = 1..10
-#   - Fixed alpha_s = 2.0
-#   - All 30 truth members
+#   - One fixed observation point (update loc below before running)
+#   - Methods: LETKF (Ntemp=1 baseline) + TEnKF sweep
+#   - Fixed alpha_s, fixed localization
+#   - One truth member (fast), scale to all 60 with --workers
 #
-# Runner:
-#   python src/runners/run_experiment.py --config configs/ws1.yaml --workers 30
+# Usage:
+#   python src/runners/run_experiment.py --config configs/ws1.yaml
+#   python src/runners/run_experiment.py --config configs/ws1.yaml --workers 10
+#
+# Timing note:
+#   Most time is spent in H(x) computation (nested Python loops over the
+#   domain). With verbose: 2 you will see timing per stage. Expected order:
+#     H(truth): ~5-20s depending on domain size
+#     H(xf):    ~5-20s * Ne/1  (ensemble version)
+#     DA:       < 1s  (Fortran LETKF, fast)
+#   If H(x) dominates, domain size or Ne is the bottleneck, not LETKF.
 #
 # Before running:
-#   1. Set paths.prepared to your extracted .npz
-#   2. Set paths.outdir
-#   3. Update sweep.obs_points.loc with a point that has reflectivity
-#      (use Notebook 1 or the obs_explorer notebook to find a good point)
+#   1. Set paths.prepared and paths.outdir
+#   2. Update sweep.obs_points.loc with a precipitating point
+#      (use the S3 notebook to find a point with reflectivity > 20 dBZ)
 
 experiment_tag: WS1_Ntemp_sweep
-verbose: 3
-skip_existing: false
+verbose: 3          # 1=one line per truth member  2=per-stage timing  3=per-step DA
+skip_existing: true # resume interrupted runs
 
 paths:
   prepared: /home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation/data/3D_subsets_20240319_DAFCST_20240319180000/subset_20240320180000.npz
@@ -33,25 +41,25 @@ state:
   var_idx: {qg: 0, qr: 1, qs: 2, T: 3, P: 4, u: 5, v: 6, w: 7}
 
 obs:
-  obs_error_var: 5.0    # variance [dBZ²]  (sigma = 5 dBZ)
+  obs_error_var: 5.0    # observation error VARIANCE [dBZ^2]  (sigma = ~2.2 dBZ)
 
 qc:
-  filter_ensemble: true
-  filter_truth:    false
+  filter_ensemble: true   # skip if ensemble mean H(x) < dbz_min
+  filter_truth:    false  # skip if truth H(x) < dbz_min
   filter_mode:     and
-  dbz_min:         5.0
+  dbz_min:         5.0    # [dBZ]
 
 sweep:
-  truth_members: 0 #all
-  prior_size:    20 #null      # use all remaining members
+  truth_members: 0        # scalar=one member, "all"=all 60, [0,1,2]=list
+  prior_size:    20       # members used as prior (null = all except truth)
 
   obs_points:
     mode: single
-    loc: {x: 84, y: 108, z: 5}   # <- update with a precipitating point
+    loc: {x: 84, y: 108, z: 5}   # UPDATE: point with reflectivity > dbz_min
 
-  methods: [TEnKF]
-  ntemp:   {start: 1, stop: 3, num: 3}   # -> [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-  alpha_s: 2.0
-  loc_x:   5.0
-  loc_y:   5.0
-  loc_z:   1.0
+  methods:  [TEnKF]
+  ntemp:    {start: 1, stop: 3, num: 3}   
+  alpha_s:  2.0
+  loc_x:    5.0   # localization scale in grid points (x)
+  loc_y:    5.0   # localization scale in grid points (y)
+  loc_z:    1.0   # localization scale in grid points (z, smaller = tighter vertical)

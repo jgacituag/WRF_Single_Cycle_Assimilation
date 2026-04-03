@@ -14,11 +14,19 @@
 #### metadata ##############################################################
 experiment_tag: MY_EXPERIMENT    # used in output filenames and the config copy
 
-# Verbosity level written to log / stdout
-#   0  silent except fatal errors
-#   1  one line per truth member  (recommended for cluster runs)
-#   2  one line per method/combo per member
-#   3  full per-step output from DA core  (debugging only)
+# Verbosity level — controls what timing and progress is printed.
+#
+#   0  silent (errors only)
+#   1  one line per truth member: start, H(x) domain count, done + total time
+#   2  per-stage timing: H(truth), H(xf), QC filtering, DA call, save
+#      Use this when diagnosing where time is spent.
+#   3  per-step DA internals (TEnKF iterations, AOEI inflation counts)
+#      Very verbose — only for debugging a single experiment.
+#
+# Recommendation:
+#   - Cluster production runs:  verbose: 1
+#   - Local timing diagnostics: verbose: 2
+#   - Debugging one experiment: verbose: 3
 verbose: 1
 
 skip_existing: False   # default — always overwrite npz file
@@ -50,22 +58,19 @@ obs:
 #### quality control #######################################################
 qc:
   # Skip points where the ensemble mean in obs space is below dbz_min.
-  filter_ensemble: true     
-
-  # Skip points where ALL ensemble members in obs space are below dbz_min.
-  # Stricter than filter_ensemble (mean-based): requires every single member
-  # to show no signal before discarding the point.
-  filter_ensemble_all: false
+  # Physical motivation: no signal in observation space -> no correction possible.
+  filter_ensemble: true     # recommended: always true
 
   # Skip points where the truth (yo) is below dbz_min.
+  # Optional: isolates the nonlinear regime where the ensemble underestimates.
   filter_truth: false
 
-  # How to combine active filters:
-  #   "and"  skip only if ALL active filters fail  (less aggressive, default)
-  #   "or"   skip if ANY active filter fails       (more aggressive)
+  # How to combine filter_ensemble and filter_truth when both are true:
+  #   "and"  skip only if BOTH conditions fail  (less aggressive filtering)
+  #   "or"   skip if EITHER condition fails     (more aggressive filtering)
   filter_mode: and
 
-  # Reflectivity threshold [dBZ] used by all filters
+  # Reflectivity threshold [dBZ] used by both filters above
   dbz_min: 5.0
 
 #### sweep #################################################################
