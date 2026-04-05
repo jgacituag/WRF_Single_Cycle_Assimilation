@@ -1,0 +1,34 @@
+experiment_tag: WS2
+verbose: 2
+skip_existing: false
+paths:
+  prepared: /home/jorge.gacitua/salidas/WRF_Single_Cycle_Assimilation/data/3D_subsets_20240319_DAFCST_20240319180000/subset_20240320180000.npz
+  outdir:   /home/jorge.gacitua/salidas/WRF_Single_Cycle_Assimilation/data/WS2/
+
+state:
+  n_members: 60
+  var_idx: {qg: 0, qr: 1, qs: 2, T: 3, P: 4, u: 5, v: 6, w: 7}
+
+obs:
+  obs_error_var: 5.0      # Sigma squared = 5.0
+
+qc:
+  filter_ensemble: true 
+  filter_truth:    false  
+  filter_mode:     and
+  dbz_min:         5.0   
+
+sweep:
+  truth_members: 0        # Truth is member 0
+  prior_size: 40          # 40 ensemble members
+  
+  obs_points:
+    mode: strided         # Multi-obs strided mode
+    stride: 5             # 5 grid points
+
+  methods:  [TEnKF]       
+  ntemp:    [1, 2, 3]     
+  alpha_s:  2.0
+  loc_x:    5.0   
+  loc_y:    5.0   
+  loc_z:    2.0

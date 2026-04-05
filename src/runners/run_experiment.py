@@ -40,6 +40,7 @@ import pathlib
 import shutil
 import sys
 import time
+import math
 from multiprocessing import Pool
 
 import numpy as np
@@ -61,7 +62,7 @@ def _get_cda():
     return cda
 
 
-# ## sweep parameter helpers ################################################
+#### sweep parameter helpers ################################################
 
 def _expand(val, is_int=False):
     """
@@ -108,22 +109,22 @@ def _qc_code(qc_cfg):
     return "none"
 
 
-def _qc_pass(yo_val, hxf_mean_val, qc_cfg):
+def _qc_pass(yo_val, hxf_val, qc_cfg):
     if not qc_cfg:
         return True
     dbz_min = float(qc_cfg.get("dbz_min", 5.0))
     fe   = bool(qc_cfg.get("filter_ensemble", True))
     ft   = bool(qc_cfg.get("filter_truth",    False))
     mode = qc_cfg.get("filter_mode", "and").lower()
-    fail_e = fe and (float(hxf_mean_val) < dbz_min)
-    fail_t = ft and (float(yo_val)       < dbz_min)
+    fail_e = fe and (float(hxf_val) < dbz_min)
+    fail_t = ft and (float(yo_val)  < dbz_min)
     if fe and ft:
         return not (fail_e and fail_t) if mode == "or" \
                else not (fail_e or fail_t)
     return not fail_e if fe else not fail_t
 
 
-# ## observation operator ###################################################
+#### observation operator ###################################################
 
 def _calc_hx_domain(state_nvar, var_idx):
     """
@@ -176,7 +177,7 @@ def _hx_point(state_nvar, i, j, k, var_idx):
                      for m in range(state_nvar.shape[0])], np.float32)
 
 
-# ## method dispatcher ######################################################
+#### method dispatcher ######################################################
 
 def _run_method(method, xf, yo, R0, ox, oy, oz, loc_scales, var_idx, ntemp, alpha_s):
     if method == "LETKF":
@@ -195,7 +196,7 @@ def _run_method(method, xf, yo, R0, ox, oy, oz, loc_scales, var_idx, ntemp, alph
     raise ValueError(f"Unknown method: {method}")
 
 
-# ## filename builders ######################################################
+#### filename builders ######################################################
 
 def _fmt(v):
     """Format a float for filenames: no trailing zeros."""
@@ -247,7 +248,7 @@ def _fname_multi(tag, method, ntemp, alpha_s, lx, ly, lz,
             f"_Ne{ne:03d}_str{stride_str}_qc{qc}_True{tm:02d}.npz")
 
 
-# ## per-truth-member worker ################################################
+#### per-truth-member worker ################################################
 
 def _worker(args):
     (tm, ens, cfg, verbose) = args
@@ -280,7 +281,7 @@ def _worker(args):
     prior_sizes = _expand(sweep["prior_size"], is_int=True) \
                   if sweep.get("prior_size") is not None else [None]
 
-    # ── truth H(x): fixed for this tm across all prior sizes ────────────
+    #### truth H(x): fixed for this tm across all prior sizes ############
     t0 = time.time()
     truth_base = ens[:, :, :, tm, :]
     nx, ny, nz = truth_base.shape[:3]
@@ -298,16 +299,17 @@ def _worker(args):
 
     for prior_size in prior_sizes:
 
-        # ── prior ensemble and its H(x) ─────────────────────────────────
+        #### prior ensemble and its H(x) #################################
         _, xf, Ne = _select_prior(ens, tm, prior_size)
 
         _t = time.time()
         ens_hx   = _calc_hx_domain(xf, var_idx)   # (nx,ny,nz,Ne)
         ens_mean = ens_hx.mean(axis=3)             # (nx,ny,nz)
+        ens_max  = ens_hx.max(axis=3)
         core._log(2, f"  [truth {tm:02d}] H(xf) Ne={Ne} done  {time.time()-_t:.1f}s"
                      f"  ({nx*ny*nz*Ne} pts)")
 
-        # ── build QC-passing obs list ────────────────────────────────────
+        #### build QC-passing obs list ####################################
         _t = time.time()
         if obs_mode == "single":
             i0, j0, k0 = int(obs_loc["x"]), int(obs_loc["y"]), int(obs_loc["z"])
@@ -326,7 +328,7 @@ def _worker(args):
             for i in range(nx):
                 for j in range(ny):
                     for k in range(nz):
-                        if _qc_pass(truth_hx[i,j,k], ens_mean[i,j,k], qc_cfg):
+                        if _qc_pass(truth_hx[i,j,k], ens_max[i,j,k], qc_cfg):
                             obs_sets.append((
                                 np.array([i], np.int32),
                                 np.array([j], np.int32),
@@ -334,9 +336,34 @@ def _worker(args):
                                 np.array([truth_hx[i,j,k]], np.float32),
                                 f"{i}_{j}_{k}",
                             ))
-            core._log(1, f"  [truth {tm:02d}] Ne={Ne}  full_grid: "
-                         f"{len(obs_sets)}/{nx*ny*nz} pts pass QC"
-                         f"  ({time.time()-_t:.1f}s)")
+            
+            
+            # 1. Pre-run check: Just print the chunk count and stop
+            if cfg.get("get_chunk_count"):
+                num_chunks = math.ceil(len(obs_sets) / cfg["chunk_size"])
+                print(num_chunks)   # The bash script 'tail -n 1' catches this
+                sys.exit(0)         # Instantly stop the entire Python process
+            
+            # 2. Slice the array if a specific chunk was requested
+            chunk_id = cfg.get("chunk_id")
+            if chunk_id is not None:
+                start_idx = (chunk_id - 1) * cfg["chunk_size"]
+                end_idx   = start_idx + cfg["chunk_size"]
+                obs_sets  = obs_sets[start_idx:end_idx]
+                
+                if not obs_sets:
+                    core._log(1, f"  [truth {tm:02d}] Chunk {chunk_id} is empty. Exiting.")
+                    return []
+                    
+                core._log(1, f"  [truth {tm:02d}] Ne={Ne} full_grid (Chunk {chunk_id}): "
+                             f"Processing {len(obs_sets)} points "
+                             f"({time.time()-_t:.1f}s)")
+            else:
+                # 3. Normal behavior (if someone runs it without chunking)
+                core._log(1, f"  [truth {tm:02d}] Ne={Ne}  full_grid: "
+                             f"{len(obs_sets)}/{nx*ny*nz} pts pass QC "
+                             f"({time.time()-_t:.1f}s)")
+
 
         else:  # "strided" or "all"
             s = stride if obs_mode == "strided" else 1
@@ -362,7 +389,8 @@ def _worker(args):
             core._log(1, f"  [truth {tm:02d}] Ne={Ne}  no valid obs, skipping")
             continue
 
-        # ── sweep over parameter combos ──────────────────────────────────
+        chunk_results = []
+        #### sweep over parameter combos ##################################
         for (ox_arr, oy_arr, oz_arr, yo_arr, loc_str) in obs_sets:
             R0 = np.full(len(yo_arr), R0_val, np.float32)
 
@@ -398,7 +426,7 @@ def _worker(args):
                 hxf_pt = ens_hx[ox_arr, oy_arr, oz_arr, :]  # (nobs, Ne)
 
                 if obs_mode in ("single", "full_grid"):
-                    # ── single-obs: scalars only, xa discarded ───────────
+                    #### single-obs: scalars only, xa discarded ###########
                     # The full analysis (nx,ny,nz,Ne,nvar) is computed by
                     # the Fortran but we extract only what we need from it
                     # and immediately free it. Nothing > (nvar,) is stored.
@@ -418,6 +446,12 @@ def _worker(args):
                     ], dtype=np.float32)
 
                     save = dict(
+                        method=method,
+                        ntemp=np.int32(ntemp),
+                        alpha_s=np.float32(alpha_s),
+                        loc_x=np.float32(lx),
+                        loc_y=np.float32(ly),
+                        loc_z=np.float32(lz),
                         # observation identity
                         obs_x=np.int32(i0),
                         obs_y=np.int32(j0),
@@ -449,9 +483,12 @@ def _worker(args):
                         save["alpha_weights"] = res["alpha_weights"]
 
                     del xa, xa_mean   # free immediately
-
+                    
+                    if obs_mode == "full_grid":
+                        chunk_results.append(save)
+                        continue  # Skip writing the individual file
                 else:
-                    # ── multi-obs: full matrices stored ──────────────────
+                    #### multi-obs: full matrices stored ##################
                     save = dict(
                         xa=res["xa"],
                         yo=yo_arr,
@@ -469,29 +506,49 @@ def _worker(args):
                                 "ntemps_per_obs","obs_error_aoei","obs_error_eff"):
                         if key in res:
                             save[key] = res[key]
+                if obs_mode != "full_grid":
+                    np.savez_compressed(out_path, **save)
+                    _sz = os.path.getsize(out_path) / 1e3
+                    core._log(2, f"    saved {_sz:.1f} KB  {time.time()-_t:.2f}s"
+                                f"  -> {fname}")
+                    saved.append(fname)
 
-                np.savez_compressed(out_path, **save)
+        if obs_mode == "full_grid" and chunk_results:
+                # Use the chunk_id if we have it, otherwise just call it 'all'
+                cid_str = f"chunk{cfg.get('chunk_id'):04d}" if cfg.get("chunk_id") is not None else "chunkALL"
+                fname = f"{tag}_fullgrid_{cid_str}_True{tm:02d}.npy"
+                out_path = os.path.join(outdir, fname)
+                
+                # Save the list of dictionaries
+                np.save(out_path, chunk_results, allow_pickle=True)
+                
                 _sz = os.path.getsize(out_path) / 1e3
-                core._log(2, f"    saved {_sz:.1f} KB  {time.time()-_t:.2f}s"
-                             f"  -> {fname}")
+                core._log(1, f"  [truth {tm:02d}] Saved CHUNK FILE: {len(chunk_results)} rows, {_sz:.1f} KB -> {fname}")
                 saved.append(fname)
-
+                
     elapsed = time.time() - t0
     core._log(1, f"[truth {tm:02d}] done  {len(saved)} files  {elapsed:.1f}s")
     return saved
 
 
-# ## main ###################################################################
+#### main ###################################################################
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config",  required=True)
     ap.add_argument("--workers", type=int, default=None)
     ap.add_argument("--verbose", type=int, default=None)
+    ap.add_argument("--chunk_id", type=int, default=None, help="1-based chunk index to run")
+    ap.add_argument("--chunk_size", type=int, default=500, help="Number of points per chunk")
+    ap.add_argument("--get_chunk_count", action="store_true", help="Print total chunks and exit")
     args = ap.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+
+    cfg["chunk_id"] = args.chunk_id
+    cfg["chunk_size"] = args.chunk_size
+    cfg["get_chunk_count"] = args.get_chunk_count
 
     verbose   = args.verbose if args.verbose is not None \
                 else int(cfg.get("verbose", 1))

@@ -11,19 +11,22 @@ tempering (TEnKF).
 .
 ├── src/
 │   ├── da/
+│   │   ├── metrics.py
 │   │   └── core.py                  # All DA methods (LETKF, TEnKF, AOEI, ATEnKF, TAOEI)
 │   ├── runners/
 │   │   └── run_experiment.py        # Unified runner for all WS experiments
 │   ├── extract_3d_subset.py         # Extract WRF ensemble subsets to .npz
-│   └── fortran/                     # Fortran LETKF source + Makefile
+│   └── fortran/                     # Fortran LETKF source
 ├── configs/
 │   ├── template.yaml                # Full reference template — start here
 │   └── build_3D_section.yaml        # Data extraction config (Notebook 1)
 ├── Notebooks/
 │   ├── S1_Explore_and_extract_3d_sections_WRF.ipynb
 │   └── S2_obs_explorer_ws2.ipynb
-└── tests/
-    └── test_da_core.py
+├── tests/
+│   └── test_da_core.py
+├── queue_chunks.sh                # PBS script for full_grid chunked processing
+└── queue_multiobs.sh              # PBS script for strided multi-obs assimilation
 ```
 
 ---
@@ -156,40 +159,37 @@ every output folder is self-contained.
 
 ### Filename convention
 
-**Single-obs:**
-```
-{tag}_{method}_Nt{ntemp}_as{alpha_s}_Lx{lx}Ly{ly}Lz{lz}_Ne{ne}_obs{x}_{y}_{z}_qc{qc}_True{tm}.npz
-```
- 
-**Multi-obs:**
-```
-{tag}_{method}_Nt{ntemp}_as{alpha_s}_Lx{lx}Ly{ly}Lz{lz}_Ne{ne}_str{stride}_qc{qc}_True{tm}.npz
-```
+### 1. Full Grid Mode (Chunked Output)
+Because saving the 3D analysis grid for every single observation would consume terabytes of space, `full_grid` mode discards `xa` and only saves the scalar metrics.
+* **Format:** NumPy array of dictionaries (`.npy`) easily loaded into Pandas.
+* **Filename:** `{tag}_fullgrid_chunk{id}_True{tm}.npy`
+* **Contents per row (dict):**
+  * `obs_idx`, `obs_x`, `obs_y`, `obs_z`
+  * `method`, `ntemp`, `error` (after inflation)
+  * `hxf_mean`, `spread_b`, `dep_b` (Prior metrics)
+  * `hxa_mean`, `spread_a`, `dep_a` (Analysis metrics)
+  * `time_da`
 
+### 2. Strided Mode (Multi-Obs Output)
+Strided mode assimilates all filtered observations at once and saves the full 3D analysis grid for physical structural analysis.
+* **Format:** Compressed NumPy archive (`.npz`)
+* **Filename:** `{tag}_{method}_Nt{ntemp}_as{alpha_s}_Lx{lx}Ly{ly}Lz{lz}_Ne{ne}_str{stride}_qc{qc}_True{tm}.npz`
+* **Contents:**
+  * `xa`: Posterior ensemble `(nx, ny, nz, Ne, nvar)`
+  * `yo`: Observations used
+  * `ox`, `oy`, `oz`: Observation grid indices
+  * `dep`: Prior innovation `yo - H(x̄^f)`
+  * `deps`: Array of departures at the *start* of each tempering step. *(Note: Does not contain final analysis departure; calculate manually via H(xa)).*
 **QC code:**
 
 | Code | Meaning |
 |------|---------|
 | `none` | no filtering |
-| `E` | ensemble mean filter only |
+| `E` | ensemble filter only |
 | `T` | truth filter only |
 | `ET_and` | both filters, AND logic |
 | `ET_or` | both filters, OR logic |
 
-### Array contents per file
-
-| Key | Description |
-|-----|-------------|
-| `xa` | posterior ensemble `(nx,ny,nz,Ne,nvar)` |
-| `yo` | observations used |
-| `hxf_mean` | prior ensemble mean in obs space |
-| `dep` | innovation `yo - H(x̄^f)` |
-| `spread` | prior ensemble spread in obs space |
-| `obs_error` | obs error variance used (after AOEI if applicable) |
-| `ox, oy, oz` | obs grid indices |
-| `truth_member` | which member was used as truth |
-| `xatemp` *(TEnKF/ATEnKF)* | ensemble at each tempering step |
-| `ntemps_per_obs` *(ATEnKF)* | per-observation Ntemp_j |
 
 ---
 

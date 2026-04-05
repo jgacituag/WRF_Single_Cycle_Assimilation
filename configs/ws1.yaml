@@ -28,13 +28,13 @@
 #   2. Update sweep.obs_points.loc with a precipitating point
 #      (use the S3 notebook to find a point with reflectivity > 20 dBZ)
 
-experiment_tag: WS1_FullGrid_Test
-verbose: 1          # 1=one line per truth member  2=per-stage timing  3=per-step DA
+experiment_tag: WS1_chunks
+verbose: 3          # 1=one line per truth member  2=per-stage timing  3=per-step DA
 skip_existing: false # resume interrupted runs
 
 paths:
-  prepared: /home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation/data/3D_subsets_20240319_DAFCST_20240319180000/subset_20240320180000.npz
-  outdir:   /home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation/data/WS1_FullGrid_Test/
+  prepared: /home/jorge.gacitua/salidas/WRF_Single_Cycle_Assimilation/data/3D_subsets_20240319_DAFCST_20240319180000/subset_20240320180000.npz
+  outdir:   /home/jorge.gacitua/salidas/WRF_Single_Cycle_Assimilation/data/WS1_chunks/
 
 state:
   n_members: 60
