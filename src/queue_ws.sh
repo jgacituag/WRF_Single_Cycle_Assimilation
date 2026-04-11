@@ -1,89 +1,98 @@
 #!/bin/bash
-#PBS -N WRF_Full_Sweep
-#PBS -l nodes=1:ppn=120          # Grab one full 48-core node
+#PBS -N WS_DA
+#PBS -l nodes=1:ppn=124
 #PBS -j oe
-#PBS -o /nfsmounts/storage/scratch/jorge.gacitua/WRF_Single_Cycle_Assimilation/logs/chunk_master.log
+#PBS -o /home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation/logs/ws_da.log
 #PBS -V
 
-cd /nfsmounts/storage/scratch/jorge.gacitua/WRF_Single_Cycle_Assimilation/
+# ---------------------------------------------------------------------------
+# queue_ws.sh — WRF Single-Cycle Assimilation job script
+#
+# Handles two modes automatically (read from config):
+#
+#   sweep     : Python multiprocessing, one worker per core.
+#               OMP_NUM_THREADS=1 to avoid Fortran thread contention.
+#
+#   multi_obs : Single Python process, Fortran uses all OMP threads.
+#               OMP_NUM_THREADS set to N_CORES below.
+#
+# Submit:
+#   qsub src/queue_ws.sh -v CONFIG=configs/ws1.yaml,TM=0
+#   qsub src/queue_ws.sh -v CONFIG=configs/ws1.yaml,TM=0,WORKERS=8
+#
+# Variables (all optional, have defaults):
+#   CONFIG   path to yaml config  (default: configs/ws1.yaml)
+#   TM       truth member index   (default: read from config)
+#   WORKERS  parallel workers for sweep mode  (default: N_CORES)
+# ---------------------------------------------------------------------------
 
-# Load environment
+set -euo pipefail
+
+# --- paths ------------------------------------------------------------------
+REPO=/home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation
+LOG_DIR=$REPO/logs
+mkdir -p "$LOG_DIR"
+
+cd "$REPO"
+
+# --- environment ------------------------------------------------------------
 source /opt/load-libs.sh 3
-source /nfsmounts/storage/scratch/jorge.gacitua/miniconda3/etc/profile.d/conda.sh
+source /home/jorge.gacitua/miniconda3/etc/profile.d/conda.sh
 conda activate intermediate_exp
 
-# Build the Fortran library directly on the compute node
 #echo "Building Fortran library on compute node: $(hostname)"
-#bash src/build_fortran.sh
-#if [ $? -ne 0 ]; then
-#    echo "ERROR: Fortran build failed on the compute node!"
-#    exit 1
-#fi
-#echo "Fortran build successful."
+bash src/build_fortran.sh
+if [ $? -ne 0 ]; then
+    echo "ERROR: Fortran build failed on the compute node!"
+    exit 1
+fi
+echo "Fortran build successful."
+# --- parameters -------------------------------------------------------------
+CONFIG=${CONFIG:-configs/ws1.yaml}
+N_CORES=124
 
-# --- THREAD CONFIGURATION ---
-export OMP_NUM_THREADS=40        # 4 cores per python process
+# Read mode from config to decide threading strategy
+MODE=$(python3 -c "
+import yaml
+with open('$CONFIG') as f: cfg = yaml.safe_load(f)
+obs = cfg['sweep']['obs_points']
+print(obs if isinstance(obs, str) else obs.get('mode','sweep'))
+")
+
+echo "[queue] config=$CONFIG  mode=$MODE  node=$(hostname)  cores=$N_CORES"
+
+# --- threading --------------------------------------------------------------
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 
-# --- CONCURRENCY LIMITS ---
-MAX_PAR=3                      
-running=0
-CHUNK_SIZE=500
-
-# --- PRE-RUN CHECK ---
-# Ask Python how many chunks there are (tail -n 1 ensures we only grab the last printed number)
-echo "Asking Python for chunk count..."
-
-# Capture ALL output from the pre-flight check
-OUTPUT=$(python src/runners/run_experiment.py --config configs/ws1.yaml --chunk_size $CHUNK_SIZE --get_chunk_count)
-EXIT_CODE=$?
-
-# 1. Did Python crash?
-if [ $EXIT_CODE -ne 0 ]; then
-    echo "ERROR: Python crashed during pre-flight check!"
-    echo "Python output was: $OUTPUT"
-    exit 1
+if [ "$MODE" = "multi_obs" ]; then
+    # Single Python process — Fortran uses all cores via OpenMP
+    export OMP_NUM_THREADS=$N_CORES
+    WORKERS=1
+    echo "[queue] multi_obs: OMP_NUM_THREADS=$OMP_NUM_THREADS"
+else
+    # Python workers — each Fortran call is single-threaded
+    export OMP_NUM_THREADS=1
+    WORKERS=${WORKERS:-$N_CORES}
+    echo "[queue] sweep: workers=$WORKERS  OMP_NUM_THREADS=1"
 fi
 
-# 2. Extract the number
-CALC_CHUNKS=$(echo "$OUTPUT" | tail -n 1)
-
-# 3. Is it actually a number?
-if ! [[ "$CALC_CHUNKS" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: Expected an integer for chunk count, got: $CALC_CHUNKS"
-    exit 1
+# --- build TM argument if provided ------------------------------------------
+TM_ARG=""
+if [ -n "${TM:-}" ]; then
+    TM_ARG="--tm $TM"
+    echo "[queue] truth member: $TM"
 fi
 
-echo "Python reports a total of $CALC_CHUNKS chunks."
+# --- run --------------------------------------------------------------------
+echo "[queue] starting at $(date)"
+t_start=$SECONDS
 
-# --- OPTIONAL OVERRIDES ---
-# If you didn't pass START or END via qsub, they default to 1 and CALC_CHUNKS
-START_CHUNK=${START:-1}
-END_CHUNK=${END:-$CALC_CHUNKS}
+python -u src/runners/run_experiment.py \
+    --config "$CONFIG" \
+    --workers "$WORKERS" \
+    --verbose 1 \
+    $TM_ARG
 
-echo "Processing Chunks $START_CHUNK to $END_CHUNK with Max Concurrency: $MAX_PAR"
-
-# --- Launch Loop ---
-for (( CHUNK_ID=$START_CHUNK; CHUNK_ID<=$END_CHUNK; CHUNK_ID++ )); do
-/chunk_master.log
-  LOGFILE="/nfsmounts/storage/scratch/jorge.gacitua/WRF_Single_Cycle_Assimilation/logs/chunk_${CHUNK_ID}.log"
-  echo "Launching Chunk $CHUNK_ID -> $LOGFILE"
-
-  python -u src/runners/run_experiment.py \
-    --config configs/ws1.yaml \
-    --chunk_id $CHUNK_ID \
-    --chunk_size $CHUNK_SIZE \
-    > "$LOGFILE" 2>&1 &
-  sleep 2
-  running=$((running+1))
-  
-  if [ "$running" -ge "$MAX_PAR" ]; then
-    wait
-    running=0
-  fi
-
-done
-
-wait
-echo "=== All chunks ($START_CHUNK to $END_CHUNK) finished ==="
+t_elapsed=$(( SECONDS - t_start ))
+echo "[queue] finished at $(date)  elapsed=${t_elapsed}s"

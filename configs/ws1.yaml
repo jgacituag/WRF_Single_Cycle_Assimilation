@@ -1,66 +1,56 @@
 # configs/ws1.yaml
 # ================
-# WS-1: single observation, Ntemp sensitivity sweep
+# WS-1: single observation, Ntemp sensitivity sweep.
 #
 # Scientific question: how many tempering iterations are needed before
-# performance saturates? Compare LETKF baseline vs TEnKF for Ntemp=1..N
-#
-# Design:
-#   - One fixed observation point (update loc below before running)
-#   - Methods: LETKF (Ntemp=1 baseline) + TEnKF sweep
-#   - Fixed alpha_s, fixed localization
-#   - One truth member (fast), scale to all 60 with --workers
+# performance saturates? Compare AOEI vs TEnKF for Ntemp=1,2,3.
 #
 # Usage:
-#   python src/runners/run_experiment.py --config configs/ws1.yaml
-#   python src/runners/run_experiment.py --config configs/ws1.yaml --workers 10
-#
-# Timing note:
-#   Most time is spent in H(x) computation (nested Python loops over the
-#   domain). With verbose: 2 you will see timing per stage. Expected order:
-#     H(truth): ~5-20s depending on domain size
-#     H(xf):    ~5-20s * Ne/1  (ensemble version)
-#     DA:       < 1s  (Fortran LETKF, fast)
-#   If H(x) dominates, domain size or Ne is the bottleneck, not LETKF.
-#
-# Before running:
-#   1. Set paths.prepared and paths.outdir
-#   2. Update sweep.obs_points.loc with a precipitating point
-#      (use the S3 notebook to find a point with reflectivity > 20 dBZ)
+#   python src/runners/run_experiment.py --config configs/ws1.yaml --tm 0
+#   python src/runners/run_experiment.py --config configs/ws1.yaml --tm 0 --verbose 3
 
-experiment_tag: WS1_chunks
-verbose: 3          # 1=one line per truth member  2=per-stage timing  3=per-step DA
-skip_existing: false # resume interrupted runs
+experiment_tag: WS1_sweep
+verbose: 1
+skip_existing: false
 
 paths:
-  prepared: /home/jorge.gacitua/salidas/WRF_Single_Cycle_Assimilation/data/3D_subsets_20240319_DAFCST_20240319180000/subset_20240320180000.npz
-  outdir:   /home/jorge.gacitua/salidas/WRF_Single_Cycle_Assimilation/data/WS1_chunks/
+  prepared: /home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation/data/3D_subsets_20240319_DAFCST_20240319180000/subset_20240320180000.npz
+  outdir:   /home/jorge.gacitua/datosmunin/WRF_Single_Cycle_Assimilation/data/WS1_sweep/
 
 state:
   n_members: 60
   var_idx: {qg: 0, qr: 1, qs: 2, T: 3, P: 4, u: 5, v: 6, w: 7}
-
+ 
 obs:
-  obs_error_var: 5.0    # observation error VARIANCE [dBZ^2]  (sigma = ~2.2 dBZ)
-
+  obs_error_var: 5.0    # variance [dBZ^2]  (sigma ~2.2 dBZ)
+ 
 qc:
-  filter_ensemble: true   # skip if ensemble mean H(x) < dbz_min
-  filter_truth:    false  # skip if truth H(x) < dbz_min
+  filter_ensemble: true
+  filter_truth:    false
   filter_mode:     and
-  dbz_min:         5.0    # [dBZ]
-
+  dbz_min:         5.0
+ 
 sweep:
-  truth_members: 0        # scalar=one member, "all"=all 60, [0,1,2]=list
-  prior_size:    40       # members used as prior (null = all except truth)
-
+  truth_members: 0
+  prior_size:    40
+ 
   obs_points:
-    mode: full_grid
-    #mode: single
-    #loc: {x: 84, y: 108, z: 5}   # UPDATE: point with reflectivity > dbz_min
-
-  methods:  [TEnKF]
-  ntemp:    {start: 1, stop: 3, num: 3}   
+    mode: sweep
+ 
+  stride: 5   # ~130k pts for timing test -- remove for full run
+ 
+  methods:  [TEnKF, AOEI]
+  ntemp:    [1, 2, 3]
   alpha_s:  2.0
-  loc_x:    5.0   # localization scale in grid points (x)
-  loc_y:    5.0   # localization scale in grid points (y)
-  loc_z:    1.0   # localization scale in grid points (z, smaller = tighter vertical)
+ 
+  # Localization in km.
+  # Old ws1 used 5 grid pts horizontal (~10 km at 2 km/pt)
+  # and 1 grid pt vertical. Your z levels: 0.25,0.5,1,2,3,4,5,6,8,10,12 km.
+  # z=5 is at index 5 (altitude=5 km). 2 km radius covers levels 3-6 km.
+  loc_x:  10.0   # [km]
+  loc_y:  10.0   # [km]
+  loc_z:   2.0   # [km]  covers ~2 levels above and below obs at z=5
+ 
+cutoff_factor: 4.0
+store_fields:  false
+ 

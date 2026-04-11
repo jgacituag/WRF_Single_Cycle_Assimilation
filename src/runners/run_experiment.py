@@ -174,10 +174,11 @@ def _setup(cfg, tm):
     var_idx = cfg["state"]["var_idx"]
 
     # --- load ---
-    t0   = time.time()
+    t0 = time.time()
+    core._log(1, f"[setup tm={tm:02d}] loading {cfg['paths']['prepared']} ...")
     data = np.load(cfg["paths"]["prepared"])
     ens  = data["state_ensemble"] if "state_ensemble" in data else data["cross_sections"]
-    ens  = np.asfortranarray(ens.astype(np.float32))
+    # ens is already float32 from extract_3d_subset.py — no copy needed here
 
     if "pos_km" not in data:
         raise KeyError(
@@ -185,10 +186,12 @@ def _setup(cfg, tm):
             "Re-run extract_3d_subset.py to add grid positions in km.")
     pos_km = data["pos_km"].astype(np.float32)   # (nx,ny,nz,3)
 
-    core._log(1, f"[setup tm={tm:02d}] loaded  {time.time()-t0:.1f}s")
+    core._log(1, f"[setup tm={tm:02d}] loaded  {time.time()-t0:.1f}s  "
+                 f"ens={ens.nbytes/1e9:.2f} GB")
 
     nx, ny, nz = ens.shape[:3]
     Ne_tot     = ens.shape[3]
+    core._log(2, f"[setup tm={tm:02d}] domain={nx}x{ny}x{nz}  Ne_tot={Ne_tot}")
 
     # --- slice truth and prior, then free ens ---
     prior_size = cfg["sweep"].get("prior_size", None)
@@ -202,26 +205,29 @@ def _setup(cfg, tm):
         all_others = all_others[:prior_size]
     Ne = len(all_others)
 
-    truth = ens[:, :, :, tm, :].copy()                        # independent copy
-    xf    = np.asfortranarray(ens[:, :, :, all_others, :])    # (nx,ny,nz,Ne,nvar)
+    core._log(2, f"[setup tm={tm:02d}] slicing truth (tm={tm}) and prior (Ne={Ne}) ...")
+    truth = ens[:, :, :, tm, :].copy()                    # (nx,ny,nz,nvar) C-order copy
+    xf    = np.asfortranarray(ens[:, :, :, all_others, :])# (nx,ny,nz,Ne,nvar) F-order
     del ens
     core._log(1, f"[setup tm={tm:02d}] ens freed  Ne={Ne}  "
                  f"xf={xf.nbytes/1e9:.2f} GB")
 
     # --- H(x) over full domain ---
     t1 = time.time()
+    core._log(2, f"[setup tm={tm:02d}] computing H(truth) over {nx}x{ny}x{nz} domain ...")
     truth_hx = _calc_hx_domain(truth, var_idx)        # (nx,ny,nz)
-    core._log(2, f"[setup tm={tm:02d}] H(truth) done  {time.time()-t1:.1f}s")
+    core._log(1, f"[setup tm={tm:02d}] H(truth) done  {time.time()-t1:.1f}s")
 
     t1 = time.time()
+    core._log(2, f"[setup tm={tm:02d}] computing H(xf)   over {nx}x{ny}x{nz}x{Ne} points ...")
     ens_hx = _calc_hx_domain(xf, var_idx)             # (nx,ny,nz,Ne)
-    core._log(2, f"[setup tm={tm:02d}] H(xf)   done  {time.time()-t1:.1f}s")
+    core._log(1, f"[setup tm={tm:02d}] H(xf)   done  {time.time()-t1:.1f}s")
 
     # --- reproducible noise field ---
-    # sigma = sqrt(obs_error_var) so the noise std matches the obs error
     sigma = float(np.sqrt(float(cfg["obs"]["obs_error_var"])))
     rng   = np.random.default_rng(42 + tm)
     noise = rng.normal(0.0, sigma, (nx, ny, nz)).astype(np.float32)
+    core._log(2, f"[setup tm={tm:02d}] noise field ready  sigma={sigma:.3f} dBZ  seed={42+tm}")
 
     # --- QC-filtered stride points ---
     stride  = int(cfg["sweep"].get("stride", 1))
@@ -229,10 +235,11 @@ def _setup(cfg, tm):
     ens_max = ens_hx.max(axis=3)                       # (nx,ny,nz)
 
     t1  = time.time()
+    core._log(2, f"[setup tm={tm:02d}] applying QC (stride={stride}) ...")
     pts = []
     for i in range(0, nx, stride):
         for j in range(0, ny, stride):
-            for k in range(0, nz):                     # no vertical stride by default
+            for k in range(0, nz):
                 if _qc_pass(truth_hx[i, j, k], ens_max[i, j, k], qc_cfg):
                     pts.append((i, j, k))
     del ens_max
@@ -564,11 +571,12 @@ def _run_sweep_sequential(pts, combos, cfg, outdir, tag, tm, Ne):
     t0 = time.time()
 
     for p_idx, (i0, j0, k0) in enumerate(pts):
-        if p_idx > 0 and p_idx % 500 == 0:
+        if p_idx % 500 == 0:
             elapsed = time.time() - t0
-            rate    = p_idx / elapsed
-            eta     = (n_pts - p_idx) / rate
-            core._log(2, f"  {p_idx}/{n_pts}  {rate:.0f} pts/s  ETA {eta/60:.1f} min")
+            rate    = p_idx / elapsed if p_idx > 0 else 0.0
+            eta     = (n_pts - p_idx) / rate if rate > 0 else 0.0
+            core._log(1, f"  [sweep] pt {p_idx}/{n_pts}  "
+                         f"{rate:.1f} pts/s  ETA {eta/60:.0f} min")
 
         meta, mets, _ = _process_point(
             i0, j0, k0, combos, var_idx, R0_val, cutoff)
