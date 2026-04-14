@@ -226,7 +226,13 @@ def _setup(cfg, tm):
     # --- reproducible noise field ---
     sigma = float(np.sqrt(float(cfg["obs"]["obs_error_var"])))
     rng   = np.random.default_rng(42 + tm)
-    noise = rng.normal(0.0, sigma, (nx, ny, nz)).astype(np.float32)
+
+    add_noise = bool(cfg["obs"].get("add_noise", False))
+    if add_noise:
+        noise = rng.normal(0.0, sigma, (nx, ny, nz)).astype(np.float32)
+    else:
+        noise = np.zeros((nx, ny, nz), dtype=np.float32)
+
     core._log(2, f"[setup tm={tm:02d}] noise field ready  sigma={sigma:.3f} dBZ  seed={42+tm}")
 
     # --- QC-filtered stride points ---
