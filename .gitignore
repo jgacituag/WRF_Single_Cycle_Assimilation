@@ -11,8 +11,10 @@ __pycache__/
 .venv
 data/
 logs/
+configs/ws*
 *.npz
 *.nc
 *.log
 *.csv
+*REPO*
 Figures/

@@ -56,6 +56,7 @@ SAFE_CORES=$(( N_CORES - 2 ))
 # Single process — Fortran uses all safe cores via OpenMP.
 # MKL/OpenBLAS kept at 1 to avoid conflict with OpenMP.
 export OMP_NUM_THREADS=$SAFE_CORES
+export OMP_STACKSIZE=512M
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
@@ -84,7 +85,7 @@ t_start=$SECONDS
 python -u src/runners/run_experiment.py \
     --config  "$CONFIG"  \
     --workers 1          \
-    --verbose 2          \
+    --verbose 3          \
     $TM_ARG
 
 echo "[queue] finished at $(date)  elapsed=$(( SECONDS - t_start ))s"

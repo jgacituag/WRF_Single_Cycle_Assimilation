@@ -84,12 +84,12 @@ obs:
   # Examples:
   #   sigma = 2.2 dBZ  ->  obs_error_var: 5.0
   #   sigma = 5.0 dBZ  ->  obs_error_var: 25.0
-  #
-  # This value is also used to set the noise std for synthetic observations:
-  #   sigma_noise = sqrt(obs_error_var)
-  # Noise is generated once per truth member with seed (42 + tm), applied
-  # to truth_hx to produce yo = truth_hx + N(0, sigma_noise).
   obs_error_var: 5.0
+
+  # Add synthetic Gaussian noise to observations.
+  # If true, yo = truth_hx + N(0, sqrt(obs_error_var)).
+  # Noise is generated once per truth member with seed (42 + tm).
+  add_noise: true
 
 # ---------------------------------------------------------------------------
 # Quality control
@@ -99,21 +99,18 @@ obs:
 # Set qc: null (or remove the section) to disable all filtering.
 
 qc:
-  # Skip points where the ensemble-max H(xf) is below dbz_min.
-  # Rationale: no signal in the ensemble -> no meaningful update possible.
-  filter_ensemble: true     
-
-  # Skip points where the truth H(x) (i.e. yo before noise) is below dbz_min.
-  # Rationale: isolates the nonlinear regime where ensemble underestimates.
-  filter_truth: false
-
-  # How to combine the two filters when both are active:
-  #   and  -> skip if BOTH fail
-  #   or   -> skip if EITHER fails
-  filter_mode: and
-
-  # Reflectivity threshold [dBZ] applied by both filters above.
+  # Reflectivity threshold [dBZ]. Points where ensemble-max H(xf) or
+  # truth H(x) fall below this are treated as non-precipitating and skipped.
   dbz_min: 0.0
+
+  # Clamp observations to the range [ensemble_min_Hx, ensemble_max_Hx].
+  # Prevents extreme outlier obs from driving unphysical updates.
+  clamp_obs: true
+
+  # Variance-based point selection: skip obs points where the prior
+  # ensemble variance in obs space is below a threshold.
+  # Rationale: low variance → ensemble carries no information → update is noise.
+  filter_variance: true
 
 # ---------------------------------------------------------------------------
 # Sweep
@@ -132,8 +129,10 @@ qc:
 sweep:
 
   # Truth member index for this run. Overridden by --tm on the command line.
-  # Scalar only — the runner processes exactly one truth member per invocation.
+  # Scalar (single run) or range {start, stop, step} (used by the runner when
+  # --tm is not passed). In cluster use, always override with --tm per job.
   truth_members: 0
+  # truth_members: {start: 0, stop: 59, step: 1}
 
   # Prior ensemble size.
   # null: use all members except the truth member (Ne = n_members - 1).

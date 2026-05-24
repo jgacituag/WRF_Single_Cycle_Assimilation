@@ -98,9 +98,10 @@ SUBROUTINE simple_letkf_wloc(nx, ny, nz, nbv, nvar, nobs, &
   ly = REAL(locs(2), r_size)
   lz = REAL(locs(3), r_size)
 
-  ! Compact-support cutoff in km (same formula, now in km units).
+  ! Compact-support cutoff in km
   ! The normalised distance d^2 is dimensionless regardless of units.
-  max_dist = 2.0d0 * SQRT(10.0d0/3.0d0) * MAX(lx, MAX(ly, lz))
+  !max_dist = 2.0d0 * SQRT(10.0d0/3.0d0) * MAX(lx, MAX(ly, lz))
+  max_dist = 2.0d0 * SQRT(10.0d0/3.0d0)
   n_updated = 0
 
   ! Pre-compute H(xf) ensemble perturbations (same for all grid points)
@@ -177,7 +178,7 @@ SUBROUTINE simple_letkf_wloc(nx, ny, nz, nbv, nvar, nobs, &
 END SUBROUTINE simple_letkf_wloc
 
 !=======================================================================
-SUBROUTINE calc_ref_ens(nx, ny, nz, nbv, qr, qs, qg, t, p, ref)
+SUBROUTINE calc_ref_ens(nx, ny, nz, nbv, qr, qs, qg, t, p, ref, min_dbz)
 !=======================================================================
 !
 ! Compute radar reflectivity for the full ensemble over the 3D domain.
@@ -204,7 +205,7 @@ SUBROUTINE calc_ref_ens(nx, ny, nz, nbv, qr, qs, qg, t, p, ref)
   REAL(r_size), INTENT(IN)  :: t (nx,ny,nz,nbv)
   REAL(r_size), INTENT(IN)  :: p (nx,ny,nz,nbv)
   REAL(r_size), INTENT(OUT) :: ref(nx,ny,nz,nbv)
-
+  REAL(r_size), INTENT(IN), OPTIONAL :: min_dbz
   INTEGER :: ix, iy, iz, im
 
 !$OMP PARALLEL DO PRIVATE(ix,iy,iz,im)
@@ -214,7 +215,7 @@ SUBROUTINE calc_ref_ens(nx, ny, nz, nbv, qr, qs, qg, t, p, ref)
         DO im = 1, nbv
           CALL calc_ref(qr(ix,iy,iz,im), qs(ix,iy,iz,im), &
                         qg(ix,iy,iz,im), t (ix,iy,iz,im), &
-                        p (ix,iy,iz,im), ref(ix,iy,iz,im))
+                        p (ix,iy,iz,im), ref(ix,iy,iz,im),min_dbz=min_dbz)
         END DO
       END DO
     END DO
@@ -224,7 +225,7 @@ SUBROUTINE calc_ref_ens(nx, ny, nz, nbv, qr, qs, qg, t, p, ref)
 END SUBROUTINE calc_ref_ens
 
 !=======================================================================
-SUBROUTINE calc_ref(qr, qs, qg, t, p, ref)
+SUBROUTINE calc_ref(qr, qs, qg, t, p, ref,min_dbz)
 !=======================================================================
 !
 ! Radar reflectivity forward operator (Tong & Xue 2006, 2008).
@@ -236,14 +237,14 @@ SUBROUTINE calc_ref(qr, qs, qg, t, p, ref)
 !    p          : pressure    [Pa]
 !
 !  OUTPUT
-!    ref        : equivalent reflectivity factor [dBZ], floor at -20 dBZ
+!    ref        : equivalent reflectivity factor [dBZ], floor at min_dbz dBZ (default -20 dBZ)
 !
 !=======================================================================
   IMPLICIT NONE
   REAL(r_size), INTENT(IN)  :: qr, qs, qg, t, p
   REAL(r_size), INTENT(OUT) :: ref
-
-  REAL(r_size), PARAMETER :: mindbz = -20.0d0
+  REAL(r_size), INTENT(IN), OPTIONAL :: min_dbz
+  REAL(r_size) :: mindbz
 
   ! Intercept parameters [m^-4]
   REAL(r_size), PARAMETER :: nor = 8.0d6
@@ -263,7 +264,13 @@ SUBROUTINE calc_ref(qr, qs, qg, t, p, ref)
   REAL(r_size) :: ro, pip
   REAL(r_size) :: cf, cf2, cf3, cf4
   REAL(r_size) :: zr, zs, zg
-
+  
+  IF (PRESENT(min_dbz)) THEN
+    mindbz = min_dbz 
+  ELSE
+    mindbz = -20.0d0
+  END IF
+  
   ! Pre-compute coefficients
   pip  = pi ** 1.75d0
   cf   = 1.0d18 * 720.0d0 / (pip * (nor**0.75d0) * (ror**1.75d0))

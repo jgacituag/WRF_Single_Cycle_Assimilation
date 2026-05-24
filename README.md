@@ -12,21 +12,39 @@ tempering (TEnKF).
 ├── src/
 │   ├── da/
 │   │   ├── metrics.py
-│   │   └── core.py                  # All DA methods (LETKF, TEnKF, AOEI, ATEnKF, TAOEI)
+│   │   └── core.py                  # All DA methods (LETKF, TEnKF, AOEI)
 │   ├── runners/
-│   │   └── run_experiment.py        # Unified runner for all WS experiments
+│   │   └── run_experiment.py        # Unified runner for all experiment modes
 │   ├── extract_3d_subset.py         # Extract WRF ensemble subsets to .npz
-│   └── fortran/                     # Fortran LETKF source
+│   ├── build_fortran.sh             # Compiles the Fortran LETKF module
+│   ├── fortran/                     # Fortran LETKF source and compiled .so
+│   ├── queue_ws.sh                  # PBS script for sweep / single_obs mode
+│   ├── queue_ws2.sh                 # PBS script for legacy strided experiment
+│   └── queue_multiobs.sh            # PBS script for multi_obs mode
 ├── configs/
 │   ├── template.yaml                # Full reference template — start here
-│   └── build_3D_section.yaml        # Data extraction config (Notebook 1)
+│   ├── build_3D_section_wrfout.yaml # Data extraction from raw wrfout files
+│   ├── build_3D_section_post.yaml   # Data extraction from post-processed files
+│   ├── ws_sweep_test.yaml           # Sweep experiment (stride 20, Nt 1–10)
+│   ├── ws_multiobs_<HHMM>.yaml      # Per-sweep multi_obs configs
+│   └── ws_sweep_<HHMM>.yaml         # Per-sweep sweep configs
 ├── Notebooks/
+│   ├── S0_Test.ipynb
 │   ├── S1_Explore_and_extract_3d_sections_WRF.ipynb
-│   └── S2_obs_explorer_ws2.ipynb
-├── tests/
+│   ├── S2_obs_explorer_ws2.ipynb
+│   ├── S3_sweep_diagnostics_Final.ipynb       # Main diagnostic notebook
+│   ├── S3_Explore_output_single_obs.ipynb
+│   ├── S3_Explore_output_Multy_Obs.ipynb
+│   ├── Plot_Evaluate_output_multiple_obs.ipynb
+│   ├── Plot_Evaluate_3D_multiple_obs.ipynb
+│   └── collector.ipynb
+├── test/
+│   ├── run_sanity_check.py
 │   └── test_da_core.py
-├── queue_chunks.sh                # PBS script for full_grid chunked processing
-└── queue_multiobs.sh              # PBS script for strided multi-obs assimilation
+├── data/                            # Input subsets and output results (git-ignored)
+├── logs/                            # Runtime logs from PBS jobs
+├── REPO_STRUCTURE.md
+└── environment.yml
 ```
 
 ---
@@ -37,32 +55,37 @@ tempering (TEnKF).
 
 ```bash
 conda env create -f environment.yml
-conda activate wrf_python_assimilation
+conda activate intermediate_exp
 ```
 
 ### 2. Build the Fortran LETKF module
 
 ```bash
-cd src/fortran && bash ../build_fortran.sh && cd ../..
+bash src/build_fortran.sh
 ```
 
 This compiles `cletkf_wloc` via `f2py` and places the `.so` in `src/fortran/`.
 All runners add that path to `sys.path` automatically.
+The PBS queue scripts re-run this step on each compute node before launching Python.
 
 ---
 
 ## Data preparation
 
 Before running any experiment you need to extract the 3D WRF ensemble subset
-from the raw `wrfout` files.
+from the raw `wrfout` files or post-processed output.
 
-**Interactive** — open `Notebooks/1__Explore_and_extract_3d_sections_WRF.ipynb`
+**Interactive** — open `Notebooks/S1_Explore_and_extract_3d_sections_WRF.ipynb`
 and follow the four steps: choose region → visualise → extract → sanity check.
 
-**Command line** — once `configs/build_3D_section.yaml` is configured:
+**Command line** — once the appropriate config is configured:
 
 ```bash
-python src/extract_3d_subset.py --config configs/build_3D_section.yaml
+# From raw wrfout files:
+python src/extract_3d_subset.py --config configs/build_3D_section_wrfout.yaml
+
+# From post-processed files:
+python src/extract_3d_subset.py --config configs/build_3D_section_post.yaml
 ```
 
 The output is a compressed `.npz` file with the following arrays:
@@ -70,9 +93,7 @@ The output is a compressed `.npz` file with the following arrays:
 | Key | Shape | Description |
 |-----|-------|-------------|
 | `state_ensemble` | `(nx, ny, nz, Ne, 8)` | All members |
-| `lats` | `(ny, nx)` | Latitude [°] |
-| `lons` | `(ny, nx)` | Longitude [°] |
-| `z_heights` | `(nz, ny, nx)` | Height above sea level [m] |
+| `pos_km` | `(nx, ny, nz, 3)` | Position [x_km, y_km, z_km] from domain corner |
 
 Variable order in the last axis of `state_ensemble`:
 
@@ -93,23 +114,21 @@ Variable order in the last axis of `state_ensemble`:
 
 All methods live in `src/da/core.py`.
 
-| Method | Function | Description |
-|--------|----------|-------------|
-| LETKF | `letkf_update` | Standard single-step LETKF |
-| TEnKF | `tenkf_update` | Tempered LETKF — fixed Ntemp, H(x) recomputed at each step |
-| AOEI | `aoei_update` | LETKF + Adaptive Observation Error Inflation (single step) |
-| ATEnKF | `atenkf_update` | Locally adaptive tempering — Ntemp determined per observation from AOEI inflation ratio |
-| TAOEI | `taoei_update` | TEnKF with AOEI recomputed at every tempering step |
+| Method | Config name | Description |
+|--------|-------------|-------------|
+| LETKF | `TEnKF` (Nt=1) | Standard single-step LETKF — backward-compat alias |
+| TEnKF | `TEnKF` | Tempered LETKF — H(x) recomputed at each tempering step |
+| AOEI | `AOEI` | LETKF + Adaptive Observation Error Inflation (single step) |
 
 ### Tempering schedule
 
-Weights follow :
+Weights follow:
 
 ```
 alpha_i = exp(-(Nt+1)*alpha_s / i) / sum_j exp(-(Nt+1)*alpha_s / j)
 ```
 
-`sum(alpha_i) = 1` guarantees that total information across all steps equals
+`sum(alpha_i) = 1` guarantees total information across all steps equals
 `R0` (information-preserving property). Larger `alpha_s` back-loads weight
 toward later iterations; `alpha_s = 0` gives equal weights.
 
@@ -117,7 +136,9 @@ toward later iterations; `alpha_s = 0` gives equal weights.
 
 R-localization (Greybush et al. 2011). The Fortran inflates observation error
 by `exp(0.5*(d/L)^2)` at distance `d` from a grid point with scale `L`.
-Set `loc_x/y/z: 99999` (or `null`) to disable localization on an axis.
+Distances and scales are in km, computed from `pos_km`.
+Set `loc_x/y/z: null` to disable localization on an axis.
+
 ---
 
 ## Running experiments
@@ -131,25 +152,54 @@ python test/run_sanity_check.py --config configs/test_sanity.yaml \
     --truth 0 --x 10 --y 0 --z 15
 ```
 
-Prints a table showing prior diagnostics, AOEI inflation ratio, ATEnKF
-`Ntemp_j`, posterior mean per method, and innovation reduction percentage.
+### 2. Observation modes
 
-### 2. Run an experiment
+The mode is set in `sweep.obs_points.mode` in the config. Three modes are available:
 
-All experiments use the same runner — the config controls everything:
+| Mode | Description | Output |
+|------|-------------|--------|
+| `single_obs` | One fixed obs point, all method combos | One `.npz` per run |
+| `sweep` | Every QC-passing stride point, each as an independent single-obs | One `.npz` per truth member |
+| `multi_obs` | All QC-passing stride points assimilated jointly (one Fortran call per combo) | One `.npz` per combo + one ref file per truth member |
 
-```bash
-python src/runners/run_experiment.py --config configs/ws1.yaml
-python src/runners/run_experiment.py --config configs/ws2.yaml --workers 30
-python src/runners/run_experiment.py --config configs/ws2.yaml --verbose 1
-```
-
-### 3. Submit to cluster
+### 3. Run locally
 
 ```bash
-qsub -v CFG=configs/ws2.yaml,WORKERS=30 queue_ws.sh
-qsub -v CFG=configs/ws3.yaml,WORKERS=30 queue_ws.sh
+# Single truth member, sequential:
+python src/runners/run_experiment.py --config configs/ws_sweep_test.yaml --tm 0
+
+# With parallel workers (sweep mode, Linux only):
+python src/runners/run_experiment.py --config configs/ws_sweep_test.yaml --tm 0 --workers 46
+
+# multi_obs mode — set OMP_NUM_THREADS instead of --workers:
+export OMP_NUM_THREADS=46
+python src/runners/run_experiment.py --config configs/ws_multiobs_1800.yaml --tm 0
 ```
+
+### 4. Submit to cluster (PBS)
+
+**Sweep / single_obs** — one job per truth member, parallelises with `--workers`:
+
+```bash
+# Single truth member:
+qsub -v CONFIG=configs/ws_sweep_test.yaml,TM=0 src/queue_ws.sh
+
+# All truth members:
+for tm in $(seq 0 59); do
+    qsub -v CONFIG=configs/ws_sweep_test.yaml,TM=$tm src/queue_ws.sh
+done
+```
+
+**Multi-obs** — one job per truth member, parallelises via OpenMP inside Fortran:
+
+```bash
+for tm in $(seq 0 59); do
+    qsub -v CONFIG=configs/ws_multiobs_1800.yaml,TM=$tm src/queue_multiobs.sh
+done
+```
+
+Optional override variables: `CONFIG` (path to yaml), `TM` (truth member index, required), `WORKERS` (sweep only, default = N_CORES − 2).
+
 ---
 
 ## Output files
@@ -157,30 +207,78 @@ qsub -v CFG=configs/ws3.yaml,WORKERS=30 queue_ws.sh
 A copy of the config yaml is written to `outdir` before any results, so
 every output folder is self-contained.
 
-### Filename convention
+### Sweep mode (one file per truth member)
 
-### 1. Full Grid Mode (Chunked Output)
-Because saving the 3D analysis grid for every single observation would consume terabytes of space, `full_grid` mode discards `xa` and only saves the scalar metrics.
-* **Format:** NumPy array of dictionaries (`.npy`) easily loaded into Pandas.
-* **Filename:** `{tag}_fullgrid_chunk{id}_True{tm}.npy`
-* **Contents per row (dict):**
-  * `obs_idx`, `obs_x`, `obs_y`, `obs_z`
-  * `method`, `ntemp`, `error` (after inflation)
-  * `hxf_mean`, `spread_b`, `dep_b` (Prior metrics)
-  * `hxa_mean`, `spread_a`, `dep_a` (Analysis metrics)
-  * `time_da`
+```
+{tag}_sweep_Ne{ne:03d}_tm{tm:02d}.npz
+```
 
-### 2. Strided Mode (Multi-Obs Output)
-Strided mode assimilates all filtered observations at once and saves the full 3D analysis grid for physical structural analysis.
-* **Format:** Compressed NumPy archive (`.npz`)
-* **Filename:** `{tag}_{method}_Nt{ntemp}_as{alpha_s}_Lx{lx}Ly{ly}Lz{lz}_Ne{ne}_str{stride}_qc{qc}_True{tm}.npz`
-* **Contents:**
-  * `xa`: Posterior ensemble `(nx, ny, nz, Ne, nvar)`
-  * `yo`: Observations used
-  * `ox`, `oy`, `oz`: Observation grid indices
-  * `dep`: Prior innovation `yo - H(x̄^f)`
-  * `deps`: Array of departures at the *start* of each tempering step. *(Note: Does not contain final analysis departure; calculate manually via H(xa)).*
-**QC code:**
+Loaded with `np.load(..., allow_pickle=True)['arr_0']` → a NumPy array of
+row dicts, one per QC-passing observation point. Each row contains:
+
+**Obs-space point metrics:**
+
+| Key | Description |
+|-----|-------------|
+| `yo` | Noisy observation [dBZ] |
+| `yo_clean` | Noise-free truth H(x) [dBZ] |
+| `dep_b` | Prior innovation `yo − H(x̄ᶠ)` [dBZ] |
+| `dep_a` | Posterior residual `yo − H(x̄ᵃ)` [dBZ] |
+| `hxf_mean_obs` | Prior ensemble mean at obs point [dBZ] |
+| `hxa_mean_obs` | Posterior ensemble mean at obs point [dBZ] |
+| `inc_obs` | Analysis increment at obs point [dBZ] |
+| `spread_f_obs` | Prior ensemble spread at obs point [dBZ] |
+| `spread_a_obs` | Posterior ensemble spread at obs point [dBZ] |
+| `rmse_f/a_point_obs` | Abs error at obs point (prior/posterior) |
+| `rmse_f/a_w_obs` | Weighted RMSE in obs space over localization volume |
+| `rmse_f/a_u_obs` | Unweighted RMSE in obs space over localization volume |
+| `loc_weights_sum` | Sum of localization weights |
+| `n_updated` | Number of grid points updated (rloc > 0) |
+| `precip_fraction_f` | Fraction of updated points with H(x̄ᶠ) > 0 |
+| `hx_dbz_local_mean_w/u` | Weighted/unweighted mean reflectivity in localization volume |
+
+**Per state variable** (for each var in `{qg, qr, qs, T, P, u, v, w}`):
+
+| Key pattern | Description |
+|-------------|-------------|
+| `rmse_f/a_point_{var}` | Abs error at obs point |
+| `rmse_f/a_w_{var}` | Weighted RMSE over localization volume |
+| `rmse_f/a_u_{var}` | Unweighted RMSE over localization volume |
+| `spread_f/a_point_{var}` | Ensemble spread at obs point |
+| `spread_f/a_w_{var}` | Weighted ensemble spread over localization volume |
+| `spread_f/a_u_{var}` | Unweighted ensemble spread over localization volume |
+
+### Multi-obs mode
+
+**Analysis file** (one per method combo):
+```
+{tag}_multi_obs_{method}_Nt{nt:02d}_as{alpha_s}_Lx{lx}Ly{ly}Lz{lz}_Ne{ne:03d}_tm{tm:02d}.npz
+```
+
+| Key | Description |
+|-----|-------------|
+| `xa` | Posterior ensemble `(nx, ny, nz, Ne, nvar)` |
+| `hxf_mean_field` | Prior ensemble-mean reflectivity field |
+| `hxa_mean_field` | Posterior ensemble-mean reflectivity field |
+| `residual_field` | `hxa_mean − truth_hx` |
+| `abs_err_f/a_field` | Absolute state error (prior/posterior) |
+| `bias_f/a_field` | Signed state bias |
+| `spread_f/a_field` | Ensemble spread field |
+| `rmse_f/a_global_{var}` | Domain-wide RMSE per state variable |
+| `bias_f/a_global_{var}` | Domain-wide bias per state variable |
+| `spread_f/a_global_{var}` | Domain-wide spread per state variable |
+
+**Reference file** (shared across all combos for one truth member):
+```
+{tag}_multi_obs_ref_Ne{ne:03d}_tm{tm:02d}.npz
+```
+
+| Key | Description |
+|-----|-------------|
+| `truth_hx_field` | Truth H(x) reflectivity field |
+| `xf_mean` | Prior ensemble mean state |
+
+**QC codes** (appear in filenames when relevant):
 
 | Code | Meaning |
 |------|---------|
@@ -190,7 +288,6 @@ Strided mode assimilates all filtered observations at once and saves the full 3D
 | `ET_and` | both filters, AND logic |
 | `ET_or` | both filters, OR logic |
 
-
 ---
 
 ## Config reference
@@ -199,9 +296,20 @@ See `configs/template.yaml` for the full documented reference with all
 options, accepted formats, and defaults. Key points:
 
 - `obs_error_var` is variance (dBZ²), not std
-- `prior_size: null` uses all remaining members (default); set to scalar or list for ensemble size sensitivity — always recorded as `_Ne{N}` in the filename
+- `obs.add_noise: true` adds N(0, √obs_error_var) noise to synthetic observations
+- `prior_size: null` uses all remaining members (default); set to integer for ensemble size sensitivity
 - Sweep parameters accept scalar, list, or `{start, stop, num}` (stop inclusive)
 - `loc_x/y/z: null` disables localization (equivalent to L=99999)
+- `qc.clamp_obs: true` clamps observations to the ensemble H(x) range
+- `qc.filter_variance: true` enables variance-based obs point selection
 - `skip_existing: true` resumes a partial run without recomputing finished files
 - `verbose: 1` is recommended for cluster runs (one line per truth member)
-```
+- `store_fields: true` (single_obs only) saves `xf_sub`, `truth_sub`, and `xa_sub`
+
+---
+
+## Known limitations
+
+- LETKF nonlinearity concentrates at high reflectivity (> 40 dBZ)
+- AOEI ≈ TEnKF(Nt=1) in the linear regime
+- Tempering shows diminishing returns beyond Nt = 5

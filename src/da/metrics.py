@@ -1,341 +1,156 @@
-"""
-src/da/metrics.py
-=================
-All metric computation for single-obs and multi-obs experiments.
-
-compute_single_obs_metrics(...)
-    Called once per (point × combo) from _process_point.
-    All H(x) arrays are precomputed by the caller — no Fortran calls here.
-    Returns a flat dict of scalars ready to be stacked into npz rows.
-
-compute_multi_obs_metrics(...)
-    Called once per combo from _run_multi_obs.
-    Returns a dict ready to be passed to np.savez_compressed.
-
-Naming convention
------------------
-  _f        : forecast (prior)
-  _a        : analysis (posterior)
-  _obs      : in observation space (reflectivity, at obs point)
-  _obs_*    : in observation space aggregated over the localization zone
-  _w        : rho-weighted (Gaussian localization weight)
-  _u        : unweighted, uniform over updated points (rho > 0)
-  _local    : aggregated over the localization zone
-  _pt       : value at the obs point location (single grid point)
-  {v}       : state variable name (e.g. qr, qs, qg, T, P, u, v, w)
-
-rho convention
---------------
-  rho = 0   outside compact-support cutoff
-  rho > 0   inside cutoff (Gaussian value)
-  mask      rho > 0  (boolean)
-"""
-
 import numpy as np
 
+def _weighted_rmse(field, weights):
+    w = np.where(np.isnan(weights), 0.0, weights)
+    w_sum = w.sum()
+    if w_sum == 0.0: return np.nan
+    return float(np.sqrt((w * field ** 2).sum() / w_sum))
 
-# ---------------------------------------------------------------------------
-# Internal helpers — work with rho=0 outside (no NaN convention)
-# ---------------------------------------------------------------------------
+def _weighted_mean(field, weights):
+    w = np.where(np.isnan(weights), 0.0, weights)
+    w_sum = w.sum()
+    if w_sum == 0.0: return np.nan
+    return float((w * field).sum() / w_sum)
 
-def _wmean(field, rho):
-    """Weighted mean: sum(rho * field) / sum(rho). Returns nan if sum==0."""
-    w_sum = float(rho.sum())
-    if w_sum == 0.0:
-        return np.nan
-    return float((rho * field).sum() / w_sum)
+def _weighted_spread(std_field, weights, Ne):
+    w = np.where(np.isnan(weights), 0.0, weights)
+    w_sum = w.sum()
+    if w_sum == 0.0: return np.nan
+    return float(np.sqrt((Ne + 1) / Ne * (w * std_field ** 2).sum() / w_sum))
 
+def _unweighted_mask(rloc):
+    return ~np.isnan(rloc) & (rloc > 0.0)
 
-def _weighted_rmse(err_field, rho):
-    """sqrt( sum(rho * err^2) / sum(rho) )"""
-    w_sum = float(rho.sum())
-    if w_sum == 0.0:
-        return np.nan
-    return float(np.sqrt((rho * err_field ** 2).sum() / w_sum))
+def _unweighted_rmse(field, mask):
+    if mask.sum() == 0: return np.nan
+    return float(np.sqrt((field[mask] ** 2).mean()))
 
+def _unweighted_mean(field, mask):
+    if mask.sum() == 0: return np.nan
+    return float(field[mask].mean())
 
-def _weighted_bias(err_field, rho):
-    """sum(rho * err) / sum(rho)  where err = mean - truth"""
-    return _wmean(err_field, rho)
-
-
-def _weighted_spread(std_field, rho):
-    """sqrt( sum(rho * std^2) / sum(rho) )"""
-    w_sum = float(rho.sum())
-    if w_sum == 0.0:
-        return np.nan
-    return float(np.sqrt((rho * std_field ** 2).sum() / w_sum))
-
-
-def _unweighted_rmse(err_field, mask):
-    """sqrt( mean(err^2) ) over mask."""
-    n = int(mask.sum())
-    if n == 0:
-        return np.nan
-    return float(np.sqrt((err_field[mask] ** 2).mean()))
-
-
-def _unweighted_bias(err_field, mask):
-    """mean(err) over mask."""
-    n = int(mask.sum())
-    if n == 0:
-        return np.nan
-    return float(err_field[mask].mean())
-
-
-def _unweighted_spread(std_field, mask):
-    """sqrt( mean(std^2) ) over mask."""
-    n = int(mask.sum())
-    if n == 0:
-        return np.nan
-    return float(np.sqrt((std_field[mask] ** 2).mean()))
-
-
-# ---------------------------------------------------------------------------
-# Single-obs metrics
-# ---------------------------------------------------------------------------
+def _unweighted_spread(std_field, mask, Ne):
+    if mask.sum() == 0: return np.nan
+    return float(np.sqrt((Ne + 1) / Ne * (std_field[mask] ** 2).mean()))
 
 def compute_single_obs_metrics(
-        xf_sub,        # (nx_s, ny_s, nz_s, Ne, nvar)  prior ensemble
-        xa_sub,        # (nx_s, ny_s, nz_s, Ne, nvar)  posterior ensemble
-        truth_sub,     # (nx_s, ny_s, nz_s, nvar)       truth state
-        ens_hx_sub,    # (nx_s, ny_s, nz_s, Ne)          H(xf) ensemble — precomputed
-        hxa_sub,       # (nx_s, ny_s, nz_s, Ne)          H(xa) ensemble — precomputed
-        truth_hx_sub,  # (nx_s, ny_s, nz_s)              H(truth) — precomputed
-        rho,           # (nx_s, ny_s, nz_s)              localization weights (0 outside)
-        ox_s, oy_s, oz_s,  # int, obs position within subdomain (0-based)
-        yo,            # scalar, observed value (with noise)
-        yo_clean,      # scalar, observed value without noise (H(truth) at obs point)
-        var_names,     # list[str], state variable names in index order
+        xf_sub, xa_sub, truth_sub,
+        ens_hx_sub, hxa_sub, truth_hx_sub,
+        rloc, ox_s, oy_s, oz_s, yo, yo_clean, var_names, Ne
 ) -> dict:
-    """
-    Compute all metrics for one (point × combo) single-observation experiment.
+    i0, j0, k0 = int(ox_s), int(oy_s), int(oz_s)  
+    mask = _unweighted_mask(rloc)                   
+    weights = rloc                                  
+    loc_wsum = float(np.nansum(weights))
+    n_updated = int(mask.sum())
 
-    No Fortran calls — all H(x) arrays must be precomputed by the caller.
+    hxf_mean_sub = ens_hx_sub.mean(axis=3)
+    hxa_mean_sub = hxa_sub.mean(axis=3)
 
-    Returns a flat dict of float scalars. Keys are described below.
-
-    Obs-point scalars
-    -----------------
-    hxf_mean_obs      prior ensemble mean H(x) at obs point
-    hxa_mean_obs      analysis ensemble mean H(x) at obs point
-    spread_f_obs      prior ensemble spread H(x) at obs point
-    spread_a_obs      analysis ensemble spread H(x) at obs point
-    dep_b             yo - hxf_mean_obs  (innovation)
-    dep_a             yo - hxa_mean_obs  (residual)
-    inc_obs           hxa_mean_obs - hxf_mean_obs  (analysis increment in obs space)
-
-    Localization zone
-    -----------------
-    n_updated         number of grid points with rho > 0
-    loc_weights_sum   sum of rho over subdomain
-
-    Environment (characterises surrounding storm)
-    ---------------------------------------------
-    truth_hx_mean_local   rho-weighted mean H(truth) in zone
-    truth_hx_max_local    max H(truth) inside rho > 0
-    truth_hx_std_local    std H(truth) inside rho > 0
-    hxf_mean_local        rho-weighted mean of ensemble-mean H(xf) in zone
-    hxf_spread_local      rho-weighted mean ensemble spread H(xf) in zone
-
-    Per state variable (replace {v} with variable name)
-    -------------------------------------------------------
-    rmse_f_w_{v}, rmse_a_w_{v}    rho-weighted RMSE
-    bias_f_w_{v}, bias_a_w_{v}    rho-weighted bias  (mean - truth)
-    spread_f_w_{v}, spread_a_w_{v} rho-weighted spread
-    rmse_f_u_{v}, rmse_a_u_{v}    unweighted RMSE  (over rho>0 points)
-    bias_f_u_{v}, bias_a_u_{v}    unweighted bias
-    spread_f_u_{v}, spread_a_u_{v} unweighted spread
-    xf_mean_pt_{v}                 prior ensemble mean at obs point
-    xa_mean_pt_{v}                 analysis ensemble mean at obs point
-    truth_pt_{v}                   truth value at obs point
-
-    Obs-space zone metrics (reflectivity over localization zone)
-    ------------------------------------------------------------
-    rmse_f_obs_w, rmse_a_obs_w    rho-weighted RMSE of H(x) field
-    bias_f_obs_w, bias_a_obs_w    rho-weighted bias of H(x) field
-    rmse_f_obs_u, rmse_a_obs_u    unweighted RMSE  (over rho>0 points)
-    bias_f_obs_u, bias_a_obs_u    unweighted bias
-    """
-
-    mask = rho > 0   # (nx_s, ny_s, nz_s) bool
-
-    # ---- ensemble means and stds -------------------------------------------
-    xf_mean = xf_sub.mean(axis=3)          # (nx_s, ny_s, nz_s, nvar)
+    xf_mean = xf_sub.mean(axis=3)
     xa_mean = xa_sub.mean(axis=3)
     xf_std  = xf_sub.std(axis=3, ddof=1)
     xa_std  = xa_sub.std(axis=3, ddof=1)
 
-    hxf_mean = ens_hx_sub.mean(axis=3)    # (nx_s, ny_s, nz_s)
-    hxa_mean = hxa_sub.mean(axis=3)
-    hxf_std  = ens_hx_sub.std(axis=3, ddof=1)
-    hxa_std  = hxa_sub.std(axis=3, ddof=1)
+    err_f_obs = hxf_mean_sub - truth_hx_sub
+    err_a_obs = hxa_mean_sub - truth_hx_sub
 
-    # ---- obs point metrics -------------------------------------------------
-    hxf_mean_obs   = float(ens_hx_sub[ox_s, oy_s, oz_s, :].mean())
-    hxf_spread_obs = float(ens_hx_sub[ox_s, oy_s, oz_s, :].std(ddof=1))
-    hxa_mean_obs   = float(hxa_sub[ox_s, oy_s, oz_s, :].mean())
-    hxa_spread_obs = float(hxa_sub[ox_s, oy_s, oz_s, :].std(ddof=1))
-    truth_hx_obs   = float(truth_hx_sub[ox_s, oy_s, oz_s])
-
-    dep_b       = float(yo) - hxf_mean_obs
-    dep_b_clean = float(yo_clean) - hxf_mean_obs   # systematic departure, no noise
-    dep_a       = float(yo) - hxa_mean_obs
-    inc_obs     = hxa_mean_obs - hxf_mean_obs
-
-    # absolute error at obs point (single point → no averaging needed)
-    err_f_obs_pt = abs(hxf_mean_obs - truth_hx_obs)
-    err_a_obs_pt = abs(hxa_mean_obs - truth_hx_obs)
-
-    # spread ratio at obs point (< 1 = spread reduction, > 1 = spread increase)
-    spread_ratio = (hxa_spread_obs / hxf_spread_obs
-                    if hxf_spread_obs > 1e-6 else np.nan)
-
-    # ---- localization zone summary -----------------------------------------
-    n_updated    = int(mask.sum())
-    loc_wsum     = float(rho.sum())
-
-    # ---- environment metrics -----------------------------------------------
-    truth_hx_mean_local = _wmean(truth_hx_sub, rho)
-    truth_hx_max_local  = float(truth_hx_sub[mask].max()) if n_updated > 0 else np.nan
-    truth_hx_std_local  = float(truth_hx_sub[mask].std()) if n_updated > 0 else np.nan
-    hxf_mean_local      = _wmean(hxf_mean, rho)
-    hxf_spread_local    = _weighted_spread(hxf_std, rho)
-
-    # ---- obs-space zone error fields ---------------------------------------
-    err_f_obs = hxf_mean - truth_hx_sub   # (nx_s, ny_s, nz_s)
-    err_a_obs = hxa_mean - truth_hx_sub
+    # Diagnostic fractional precipitation metric to map storm-edge conditions
+    precip_fraction_f = float((hxf_mean_sub[mask] > 0.0).mean())
 
     out = dict(
-        # obs point
-        hxf_mean_obs    = hxf_mean_obs,
-        hxa_mean_obs    = hxa_mean_obs,
-        spread_f_obs    = hxf_spread_obs,
-        spread_a_obs    = hxa_spread_obs,
-        dep_b           = dep_b,
-        dep_b_clean     = dep_b_clean,
-        dep_a           = dep_a,
-        inc_obs         = inc_obs,
-        err_f_obs_pt    = err_f_obs_pt,
-        err_a_obs_pt    = err_a_obs_pt,
-        spread_ratio    = spread_ratio,
-        # localization zone
-        n_updated       = float(n_updated),   # float so npz stacking works uniformly
-        loc_weights_sum = loc_wsum,
-        # environment
-        truth_hx_mean_local = truth_hx_mean_local,
-        truth_hx_max_local  = truth_hx_max_local,
-        truth_hx_std_local  = truth_hx_std_local,
-        hxf_mean_local      = hxf_mean_local,
-        hxf_spread_local    = hxf_spread_local,
-        # obs-space zone — weighted
-        rmse_f_obs_w = _weighted_rmse(err_f_obs, rho),
-        rmse_a_obs_w = _weighted_rmse(err_a_obs, rho),
-        bias_f_obs_w = _weighted_bias(err_f_obs, rho),
-        bias_a_obs_w = _weighted_bias(err_a_obs, rho),
-        # obs-space zone — unweighted
-        rmse_f_obs_u = _unweighted_rmse(err_f_obs, mask),
-        rmse_a_obs_u = _unweighted_rmse(err_a_obs, mask),
-        bias_f_obs_u = _unweighted_bias(err_f_obs, mask),
-        bias_a_obs_u = _unweighted_bias(err_a_obs, mask),
+        yo=float(yo),
+        yo_clean=float(yo_clean),
+        loc_weights_sum=loc_wsum,
+        n_updated=n_updated,
+
+        hxf_mean_obs=float(hxf_mean_sub[i0, j0, k0]),
+        hxa_mean_obs=float(hxa_mean_sub[i0, j0, k0]),
+        dep_b=float(yo) - float(hxf_mean_sub[i0, j0, k0]),
+        dep_a=float(yo) - float(hxa_mean_sub[i0, j0, k0]),
+        inc_obs=float(hxa_mean_sub[i0, j0, k0]) - float(hxf_mean_sub[i0, j0, k0]),
+        spread_f_obs=float(ens_hx_sub[i0, j0, k0, :].std(ddof=1)),
+        spread_a_obs=float(hxa_sub[i0, j0, k0, :].std(ddof=1)),
+
+        rmse_f_point_obs=float(np.abs(err_f_obs[i0, j0, k0])),
+        rmse_a_point_obs=float(np.abs(err_a_obs[i0, j0, k0])),
+        rmse_f_w_obs=_weighted_rmse(err_f_obs, weights),
+        rmse_a_w_obs=_weighted_rmse(err_a_obs, weights),
+        rmse_f_u_obs=_unweighted_rmse(err_f_obs, mask),
+        rmse_a_u_obs=_unweighted_rmse(err_a_obs, mask),
+
+        hx_dbz_local_mean_w=_weighted_mean(hxf_mean_sub, weights),
+        hx_dbz_local_mean_u=_unweighted_mean(hxf_mean_sub, mask),
+        precip_fraction_f=precip_fraction_f,
     )
 
-    # ---- per state variable ------------------------------------------------
     for iv, vname in enumerate(var_names):
         err_f = xf_mean[..., iv] - truth_sub[..., iv]
         err_a = xa_mean[..., iv] - truth_sub[..., iv]
-        sf    = xf_std[..., iv]
-        sa    = xa_std[..., iv]
+        std_f = xf_std[..., iv]
+        std_a = xa_std[..., iv]
 
-        out[f"rmse_f_w_{vname}"]   = _weighted_rmse(err_f, rho)
-        out[f"rmse_a_w_{vname}"]   = _weighted_rmse(err_a, rho)
-        out[f"bias_f_w_{vname}"]   = _weighted_bias(err_f, rho)
-        out[f"bias_a_w_{vname}"]   = _weighted_bias(err_a, rho)
-        out[f"spread_f_w_{vname}"] = _weighted_spread(sf,  rho)
-        out[f"spread_a_w_{vname}"] = _weighted_spread(sa,  rho)
+        out[f"rmse_f_point_{vname}"] = float(np.abs(err_f[i0, j0, k0]))
+        out[f"rmse_a_point_{vname}"] = float(np.abs(err_a[i0, j0, k0]))
+        out[f"spread_f_point_{vname}"] = float(std_f[i0, j0, k0])
+        out[f"spread_a_point_{vname}"] = float(std_a[i0, j0, k0])
 
-        out[f"rmse_f_u_{vname}"]   = _unweighted_rmse(err_f, mask)
-        out[f"rmse_a_u_{vname}"]   = _unweighted_rmse(err_a, mask)
-        out[f"bias_f_u_{vname}"]   = _unweighted_bias(err_f, mask)
-        out[f"bias_a_u_{vname}"]   = _unweighted_bias(err_a, mask)
-        out[f"spread_f_u_{vname}"] = _unweighted_spread(sf, mask)
-        out[f"spread_a_u_{vname}"] = _unweighted_spread(sa, mask)
+        out[f"rmse_f_w_{vname}"] = _weighted_rmse(err_f, weights)
+        out[f"rmse_a_w_{vname}"] = _weighted_rmse(err_a, weights)
+        out[f"spread_f_w_{vname}"] = _weighted_spread(std_f, weights, Ne)
+        out[f"spread_a_w_{vname}"] = _weighted_spread(std_a, weights, Ne)
 
-        out[f"xf_mean_pt_{vname}"] = float(xf_mean[ox_s, oy_s, oz_s, iv])
-        out[f"xa_mean_pt_{vname}"] = float(xa_mean[ox_s, oy_s, oz_s, iv])
-        out[f"truth_pt_{vname}"]   = float(truth_sub[ox_s, oy_s, oz_s, iv])
+        out[f"rmse_f_u_{vname}"] = _unweighted_rmse(err_f, mask)
+        out[f"rmse_a_u_{vname}"] = _unweighted_rmse(err_a, mask)
+        out[f"spread_f_u_{vname}"] = _unweighted_spread(std_f, mask, Ne)
+        out[f"spread_a_u_{vname}"] = _unweighted_spread(std_a, mask, Ne)
 
     return out
 
-
-# ---------------------------------------------------------------------------
-# Multi-obs metrics
-# ---------------------------------------------------------------------------
-
 def compute_multi_obs_metrics(
-        xa,                # (nx, ny, nz, Ne, nvar)  analysis ensemble
-        xf,                # (nx, ny, nz, Ne, nvar)  prior ensemble
-        truth,             # (nx, ny, nz, nvar)        truth state
-        hxf_mean_field,    # (nx, ny, nz)              H(xf_mean) — precomputed
-        hxa_mean_field,    # (nx, ny, nz)              H(xa_mean) — precomputed
-        truth_hx_field,    # (nx, ny, nz)              H(truth) — precomputed
-        var_names,         # list[str]                 state variable names
-        store_fields=False,
+        xa, xf, truth,
+        hxf_mean_field, hxa_mean_field, truth_hx_field,
+        var_names, Ne, store_fields=False
 ) -> dict:
-    """
-    Compute metrics and assemble save dict for one multi-obs combo.
-
-    store_fields=False (default, compact)
-    --------------------------------------
-    xa_mean            (nx, ny, nz, nvar)  analysis ensemble mean
-    hxf_mean_field     (nx, ny, nz)        prior mean reflectivity field
-    hxa_mean_field     (nx, ny, nz)        analysis mean reflectivity field
-    truth_hx_field     (nx, ny, nz)        truth reflectivity field
-    innovation_field   (nx, ny, nz)        hxf_mean - truth_hx
-    residual_field     (nx, ny, nz)        hxa_mean - truth_hx
-    rmse_f_global_{v}  scalar per variable
-    rmse_a_global_{v}  scalar per variable
-    bias_f_global_{v}  scalar per variable
-    bias_a_global_{v}  scalar per variable
-    spread_f_global_{v} scalar per variable
-    spread_a_global_{v} scalar per variable
-
-    store_fields=True (full, for selected cases only)
-    --------------------------------------------------
-    All of the above, plus:
-    xa                 (nx, ny, nz, Ne, nvar)  full analysis ensemble
-    xf                 (nx, ny, nz, Ne, nvar)  full prior ensemble
-    """
-    xa_mean = xa.mean(axis=3).astype(np.float32)   # (nx, ny, nz, nvar)
     xf_mean = xf.mean(axis=3)
-    xa_std  = xa.std(axis=3, ddof=1)
+    xa_mean = xa.mean(axis=3)
     xf_std  = xf.std(axis=3, ddof=1)
+    xa_std  = xa.std(axis=3, ddof=1) if xa.shape[3] > 1 else np.zeros_like(xf_std)
 
-    innovation_field = (hxf_mean_field - truth_hx_field).astype(np.float32)
-    residual_field   = (hxa_mean_field - truth_hx_field).astype(np.float32)
+    err_hxf_field  = hxf_mean_field - truth_hx_field
+    residual_field = hxa_mean_field - truth_hx_field
+
+    abs_err_f_field = np.abs(xf_mean - truth)
+    abs_err_a_field = np.abs(xa_mean - truth)
+    bias_f_field    = xf_mean - truth
+    bias_a_field    = xa_mean - truth
 
     out = dict(
-        xa_mean          = xa_mean,
-        hxf_mean_field   = hxf_mean_field.astype(np.float32),
-        hxa_mean_field   = hxa_mean_field.astype(np.float32),
-        truth_hx_field   = truth_hx_field.astype(np.float32),
-        innovation_field = innovation_field,
-        residual_field   = residual_field,
+        hxf_mean_field=hxf_mean_field, hxa_mean_field=hxa_mean_field,
+        truth_hx_field=truth_hx_field,
+        err_hxf_field=err_hxf_field, residual_field=residual_field,
+        abs_err_f_field=abs_err_f_field.astype(np.float32),
+        abs_err_a_field=abs_err_a_field.astype(np.float32),
+        bias_f_field=bias_f_field.astype(np.float32),
+        bias_a_field=bias_a_field.astype(np.float32),
+        spread_f_field=xf_std.astype(np.float32),
+        spread_a_field=xa_std.astype(np.float32),
     )
 
-    # global scalars per variable
+    if store_fields:
+        out["xf"] = xf.astype(np.float32)
+        out["xa"] = xa.astype(np.float32)
+        out["truth_state"] = truth.astype(np.float32)
+
     for iv, vname in enumerate(var_names):
         err_f = xf_mean[..., iv] - truth[..., iv]
         err_a = xa_mean[..., iv] - truth[..., iv]
-        out[f"rmse_f_global_{vname}"]    = float(np.sqrt((err_f ** 2).mean()))
-        out[f"rmse_a_global_{vname}"]    = float(np.sqrt((err_a ** 2).mean()))
-        out[f"bias_f_global_{vname}"]    = float(err_f.mean())
-        out[f"bias_a_global_{vname}"]    = float(err_a.mean())
-        out[f"spread_f_global_{vname}"]  = float(xf_std[..., iv].mean())
-        out[f"spread_a_global_{vname}"]  = float(xa_std[..., iv].mean())
+        out[f"rmse_f_global_{vname}"] = float(np.sqrt((err_f ** 2).mean()))
+        out[f"rmse_a_global_{vname}"] = float(np.sqrt((err_a ** 2).mean()))
+        out[f"bias_f_global_{vname}"] = float(err_f.mean())
+        out[f"bias_a_global_{vname}"] = float(err_a.mean())
 
-    if store_fields:
-        out["xa"] = xa.astype(np.float32)
-        out["xf"] = xf.astype(np.float32)
+        out[f"spread_f_global_{vname}"] = float(np.sqrt((Ne+1)/Ne * (xf_std[..., iv]**2).mean()))
+        out[f"spread_a_global_{vname}"] = float(np.sqrt((Ne+1)/Ne * (xa_std[..., iv]**2).mean()))
 
     return out
