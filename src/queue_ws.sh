@@ -78,7 +78,8 @@ export VECLIB_MAXIMUM_THREADS=1
 # PBS cannot expand variables in #PBS -o, so we redirect manually.
 # The dummy PBS log goes to /tmp on the compute node and is discarded.
 TM=${TM:-notm}
-LOG_FILE="$LOG_DIR/ws_da_tm${TM}_W${WORKERS}_new_2.log"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+LOG_FILE="$LOG_DIR/ws_da_tm${TM}_W${WORKERS}_${TIMESTAMP}.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 echo "[queue] logging to $LOG_FILE"
 

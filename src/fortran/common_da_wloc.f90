@@ -101,7 +101,7 @@ SUBROUTINE simple_letkf_wloc(nx, ny, nz, nbv, nvar, nobs, &
   ! Compact-support cutoff in km
   ! The normalised distance d^2 is dimensionless regardless of units.
   !max_dist = 2.0d0 * SQRT(10.0d0/3.0d0) * MAX(lx, MAX(ly, lz))
-  max_dist = 2.0d0 * SQRT(10.0d0/3.0d0)
+  max_dist = (2.0d0 * SQRT(10.0d0/3.0d0))**2
   n_updated = 0
 
   ! Pre-compute H(xf) ensemble perturbations (same for all grid points)

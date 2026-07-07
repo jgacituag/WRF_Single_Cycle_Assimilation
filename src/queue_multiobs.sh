@@ -1,7 +1,7 @@
 #!/bin/bash
 #PBS -N WS_MULTIOBS
-#PBS -l nodes=1:ppn=120
-#PBS -o /tmp/ws_multiobs_pbs_dummy.log
+#PBS -l nodes=1:ppn=48
+#PBS -o /home/jorge.gacitua/salidas/WRF_Single_Cycle_Assimilation/logs/ws_multiobs_pbs_dummy.log
 #PBS -j oe
 #PBS -V
 
