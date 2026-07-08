@@ -16,5 +16,7 @@ configs/ws*
 *.nc
 *.log
 *.csv
+*.png
+*.pdf
 *REPO*
 Figures/
