@@ -56,7 +56,15 @@ SAFE_CORES=$(( N_CORES - 2 ))
 # Single process — Fortran uses all safe cores via OpenMP.
 # MKL/OpenBLAS kept at 1 to avoid conflict with OpenMP.
 export OMP_NUM_THREADS=$SAFE_CORES
-export OMP_STACKSIZE=512M
+# simple_letkf_wloc puts hxfpert_loc(nobs,nbv) on each OpenMP thread's stack: nobs*nbv*8
+# bytes per thread. 512M silently segfaults once nobs*nbv > 67e6 -- that is what stranded
+# the orphaned ref_Ne059 in data/WS_multiobs_1800/ (stride=1: 3,007,528 x 59 x 8 = 1354 MB).
+# The outer routine's nobs-sized arrays sit on the master stack, hence ulimit -s too.
+#   stride=2, Ne=40 -> 212 MB     stride=2, Ne=59 -> 312 MB
+#   stride=1, Ne=40 ->  918 MB    stride=1, Ne=59 -> 1354 MB
+# da/core.py::_check_stack_for now raises before the Fortran call if these are too small.
+ulimit -s unlimited
+export OMP_STACKSIZE=${OMP_STACKSIZE:-2G}
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1

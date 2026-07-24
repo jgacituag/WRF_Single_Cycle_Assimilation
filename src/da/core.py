@@ -37,6 +37,62 @@ def _get_cda():
         "Run src/build_fortran.sh from the repo root first."
     )
 
+def _parse_omp_stacksize(s):
+    """OMP_STACKSIZE grammar: digits, optional whitespace, optional B|K|M|G. Default unit K."""
+    s = s.strip()
+    i = 0
+    while i < len(s) and s[i].isdigit():
+        i += 1
+    if i == 0:
+        return None
+    n = int(s[:i])
+    unit = s[i:].strip().upper() or "K"
+    return n * {"B": 1, "K": 1024, "M": 1024**2, "G": 1024**3}.get(unit, 1024)
+
+_stack_checked = set()
+
+def _check_stack_for(nobs, Ne):
+    """simple_letkf_wloc holds nobs-sized automatic arrays on *two* different stacks:
+
+      * the outer routine's hxfpert(nobs,nbv), hxfmean/oerr_dp/dep_dp(nobs) live on the
+        master thread's stack, bounded by RLIMIT_STACK (`ulimit -s`);
+      * the OpenMP-PRIVATE hxfpert_loc(nobs,nbv) and rloc_loc/dep_loc(nobs) get one copy
+        per worker thread, bounded by OMP_STACKSIZE.
+
+    Overflowing either is a bare SIGSEGV with no diagnostic, and in multi_obs mode it lands
+    *after* the reference file has been written -- which is what stranded an orphaned
+    ref_Ne059 in data/WS_multiobs_1800/ (nobs=3,007,528, Ne=59 needs 1354 MB/thread against
+    queue_multiobs.sh's OMP_STACKSIZE=512M). Fail loudly instead.
+    """
+    import resource
+
+    need = int(nobs * (Ne + 2) * 8 * 1.15)      # +2 covers rloc_loc/dep_loc; 15% slack
+    if need < 4 * 1024**2 or (nobs, Ne) in _stack_checked:
+        return
+    _stack_checked.add((nobs, Ne))
+    mb = need / 1024**2
+
+    soft, _ = resource.getrlimit(resource.RLIMIT_STACK)
+    if soft != resource.RLIM_INFINITY and soft < need:
+        raise RuntimeError(
+            f"master-thread stack too small for the Fortran LETKF: nobs={nobs}, Ne={Ne} "
+            f"needs ~{mb:.0f} MB but `ulimit -s` is {soft/1024**2:.0f} MB. "
+            f"Run `ulimit -s unlimited` before invoking the runner."
+        )
+
+    raw = os.environ.get("OMP_STACKSIZE")
+    have = _parse_omp_stacksize(raw) if raw else None
+    if have is None:
+        _log(0, f"[WARN] OMP_STACKSIZE is unset; each OpenMP thread needs ~{mb:.0f} MB of "
+                f"stack for nobs={nobs}, Ne={Ne}. Export OMP_STACKSIZE={max(1, int(mb/1024)+1)}G "
+                f"or the Fortran call will segfault.")
+    elif have < need:
+        raise RuntimeError(
+            f"OMP_STACKSIZE={raw} is too small for the Fortran LETKF: nobs={nobs}, Ne={Ne} "
+            f"needs ~{mb:.0f} MB per thread. Export OMP_STACKSIZE="
+            f"{max(1, int(mb/1024)+1)}G (and `ulimit -s unlimited`)."
+        )
+
 def tempering_schedule(ntemp: int, alpha_s: float) -> np.ndarray:
     """
     Back-loaded exponential weights.
@@ -107,6 +163,8 @@ def _letkf_step(xf_grid, hxf, yo, obs_error_var,
 
     _log(3, f"Running LETKF step: nobs={nobs}  "
             f"oerr_mean={oerr_f.mean():.2f}  locs={locs_f} km")
+
+    _check_stack_for(nobs, Ne)
 
     t0 = time.time()
     xa_out, n_updated = cda.simple_letkf_wloc(

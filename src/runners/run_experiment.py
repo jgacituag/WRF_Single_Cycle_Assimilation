@@ -166,12 +166,25 @@ def _setup(cfg, tm):
 
     stride = int(cfg["sweep"].get("stride", 1))
 
-    if do_var_filt:
-        ens_var = ens_hx.var(axis=3)                   
+    mask_from = cfg["sweep"].get("obs_mask_from", None)
+    if mask_from is not None:
+        # Reuse another run's observation set verbatim. QC (`ens_hx.var > 0`) depends on Ne,
+        # so recomputing it would confound an Ne comparison with a change in which points are
+        # observed. Variance over a superset of members is >0 wherever it is >0 over a subset,
+        # so the smaller-Ne point set is a subset of the larger-Ne one and can be shared.
+        with np.load(mask_from) as ref:
+            ix, iy, iz = ref["ix"], ref["iy"], ref["iz"]
+        if ix.max() >= nx or iy.max() >= ny or iz.max() >= nz:
+            raise ValueError(f"obs_mask_from indices exceed domain {nx}x{ny}x{nz}: {mask_from}")
+        pts = [(int(a), int(b), int(c)) for a, b, c in zip(ix, iy, iz)]
+        core._log(1, f"[setup tm={tm:02d}] obs mask loaded from {os.path.basename(mask_from)}: "
+                     f"{len(pts)} points (stride/QC in this config ignored)")
+    elif do_var_filt:
+        ens_var = ens_hx.var(axis=3)
         pts = [(i, j, k) for i in range(0, nx, stride) for j in range(0, ny, stride) for k in range(0, nz) if ens_var[i, j, k] > 0.0]
         del ens_var
     else:
-        ens_max = ens_hx.max(axis=3)                   
+        ens_max = ens_hx.max(axis=3)
         pts = [(i, j, k) for i in range(0, nx, stride) for j in range(0, ny, stride) for k in range(0, nz) if _qc_pass(yo_field[i, j, k], ens_max[i, j, k], qc_cfg)]
         del ens_max
 

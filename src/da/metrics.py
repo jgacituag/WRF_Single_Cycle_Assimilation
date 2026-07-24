@@ -102,10 +102,31 @@ def crps_ensemble_sorted(ens, truth, axis=3):
     ens = np.moveaxis(ens, axis, -1)
     Ne = ens.shape[-1]
     sorted_ens = np.sort(ens, axis=-1)
-    term1 = np.abs(ens - truth[..., np.newaxis]).mean(axis=-1)
+    # float64 accumulator: a float32 sum over Ne members is wrong by ~1e-3 when one member
+    # dominates (hydrometeors are typically 0 in all but a few members), and numpy only uses
+    # pairwise summation when the reduction axis is contiguous, so the float32 result also
+    # depended on the caller's memory layout. term2 is already float64 via the int weights.
+    term1 = np.abs(ens - truth[..., np.newaxis]).mean(axis=-1, dtype=np.float64)
     weight = (2 * np.arange(1, Ne + 1) - Ne - 1)
     term2 = (weight * sorted_ens).sum(axis=-1) / (Ne ** 2)
     return term1 - term2
+
+def _per_var(fn, ens, *extra):
+    """Apply a member-axis reduction one state variable at a time, then restack.
+
+    `fn(ens[..., iv], *(e[..., iv] for e in extra))` must return a (nx,ny,nz) field.
+    Numerically identical to calling `fn` on the whole 5-D array, but the largest
+    temporary is (nx,ny,nz,Ne) rather than (nx,ny,nz,Ne,nvar). At the full 558x898x11
+    domain with Ne=59 that is 1.3 GB instead of 10.4 GB, and np.sort / dev**4 / the
+    float64 CRPS weighting each allocate one of them.
+    """
+    nvar = ens.shape[-1]
+    first = fn(ens[..., 0], *(e[..., 0] for e in extra))
+    out = np.empty(first.shape + (nvar,), dtype=first.dtype)
+    out[..., 0] = first
+    for iv in range(1, nvar):
+        out[..., iv] = fn(ens[..., iv], *(e[..., iv] for e in extra))
+    return out
 
 def compute_single_obs_metrics(
         xf_sub, xa_sub, truth_sub,
@@ -193,6 +214,14 @@ def compute_single_obs_metrics(
         std_f = xf_std[..., iv]
         std_a = xa_std[..., iv]
 
+        # Signed ensemble-mean state value at the obs point (forecast, analysis, truth).
+        # Lets a per-point single-obs cross-section be reconstructed from sweep output
+        # (the rmse_*_point_* keys only store |mean - truth|, so sign/magnitude of e.g. w
+        # are otherwise unrecoverable). Increment = mean_a_point - mean_f_point.
+        out[f"mean_f_point_{vname}"] = float(xf_mean[i0, j0, k0, iv])
+        out[f"mean_a_point_{vname}"] = float(xa_mean[i0, j0, k0, iv])
+        out[f"truth_point_{vname}"]  = float(truth_sub[i0, j0, k0, iv])
+
         out[f"rmse_f_point_{vname}"] = float(np.abs(err_f[i0, j0, k0]))
         out[f"rmse_a_point_{vname}"] = float(np.abs(err_a[i0, j0, k0]))
         out[f"spread_f_point_{vname}"] = float(std_f[i0, j0, k0])
@@ -245,8 +274,8 @@ def compute_multi_obs_metrics(
 ) -> dict:
     xf_mean = xf.mean(axis=3)
     xa_mean = xa.mean(axis=3)
-    xf_std  = xf.std(axis=3, ddof=1)
-    xa_std  = xa.std(axis=3, ddof=1) if xa.shape[3] > 1 else np.zeros_like(xf_std)
+    xf_std  = _per_var(lambda e: e.std(axis=3, ddof=1), xf)
+    xa_std  = _per_var(lambda e: e.std(axis=3, ddof=1), xa) if xa.shape[3] > 1 else np.zeros_like(xf_std)
 
     err_hxf_field  = hxf_mean_field - truth_hx_field
     residual_field = hxa_mean_field - truth_hx_field
@@ -259,13 +288,15 @@ def compute_multi_obs_metrics(
     # Nerger (2022)-style non-Gaussianity/skill diagnostics, full domain x nvar.
     # Uses the sorted O(Ne log Ne) CRPS estimator (not the O(Ne^2) pairwise one) —
     # the pairwise array would be nx*ny*nz*nvar*Ne^2 elements, far too large here.
-    skew_f_field = ensemble_skew(xf, axis=3)
-    kurt_f_field = ensemble_kurt(xf, axis=3)
-    crps_f_field = crps_ensemble_sorted(xf, truth, axis=3)
+    # Each reduction runs one state variable at a time via _per_var: at Ne=59 the
+    # whole-array form peaks around +30 GB of temporaries, which OOMs the node.
+    skew_f_field = _per_var(lambda e: ensemble_skew(e, axis=3), xf)
+    kurt_f_field = _per_var(lambda e: ensemble_kurt(e, axis=3), xf)
+    crps_f_field = _per_var(lambda e, t: crps_ensemble_sorted(e, t, axis=3), xf, truth)
     if xa.shape[3] > 1:
-        skew_a_field = ensemble_skew(xa, axis=3)
-        kurt_a_field = ensemble_kurt(xa, axis=3)
-        crps_a_field = crps_ensemble_sorted(xa, truth, axis=3)
+        skew_a_field = _per_var(lambda e: ensemble_skew(e, axis=3), xa)
+        kurt_a_field = _per_var(lambda e: ensemble_kurt(e, axis=3), xa)
+        crps_a_field = _per_var(lambda e, t: crps_ensemble_sorted(e, t, axis=3), xa, truth)
     else:
         skew_a_field = np.full_like(skew_f_field, np.nan)
         kurt_a_field = np.full_like(kurt_f_field, np.nan)
