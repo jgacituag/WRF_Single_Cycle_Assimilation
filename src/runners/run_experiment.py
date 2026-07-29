@@ -333,7 +333,7 @@ def _process_point(i0, j0, k0, combos, var_idx, R0_val,
         metrics_rows[c] = compute_single_obs_metrics(
             xf_sub, xa_sub, truth_sub,
             ens_hx_sub, hxa_sub, truth_hx_sub,
-            rho, ox_s, oy_s, oz_s, yo, yo_clean, var_names, Ne)
+            rho, ox_s, oy_s, oz_s, yo, yo_clean, var_names, Ne, dbz_min=dbz_min)
  
         if return_fields:
             fields[c] = xa_sub
@@ -491,7 +491,7 @@ def _run_multi_obs(pts, combos, cfg, outdir, tag, tm, Ne):
             yo       = yo,
             yo_clean = yo_clean,
             ix=ix, iy=iy, iz=iz,
-            var_names = np.array(list(var_idx.keys())),
+            var_names = np.array([k for k, _ in sorted(var_idx.items(), key=lambda x: x[1])]),
         )
 
     for (method, ntemp, alpha_s, lx_km, ly_km, lz_km) in combos:
@@ -533,7 +533,8 @@ def _run_multi_obs(pts, combos, cfg, outdir, tag, tm, Ne):
         m = compute_multi_obs_metrics(
             xa, xf, truth,
             hxf_mean_field, hxa_mean_field, truth_hx_field,
-            var_names, Ne, store_fields=store_fields)
+            var_names, Ne, store_fields=store_fields,
+            ens_hxf=_ENS_HX, ens_hxa=hxa_ens, dbz_min=dbz_min)
         core._log(3, f"  [multi_obs] metrics done, saving -> {fname}")
 
         np.savez_compressed(out,

@@ -131,9 +131,9 @@ def _per_var(fn, ens, *extra):
 def compute_single_obs_metrics(
         xf_sub, xa_sub, truth_sub,
         ens_hx_sub, hxa_sub, truth_hx_sub,
-        rloc, ox_s, oy_s, oz_s, yo, yo_clean, var_names, Ne
+        rloc, ox_s, oy_s, oz_s, yo, yo_clean, var_names, Ne, dbz_min=0.0
 ) -> dict:
-    i0, j0, k0 = int(ox_s), int(oy_s), int(oz_s)  
+    i0, j0, k0 = int(ox_s), int(oy_s), int(oz_s)
     mask = _unweighted_mask(rloc)                   
     weights = rloc                                  
     loc_wsum = float(np.nansum(weights))
@@ -141,6 +141,12 @@ def compute_single_obs_metrics(
 
     hxf_mean_sub = ens_hx_sub.mean(axis=3)
     hxa_mean_sub = hxa_sub.mean(axis=3)
+    hxf_std_sub  = ens_hx_sub.std(axis=3, ddof=1)
+    hxa_std_sub  = hxa_sub.std(axis=3, ddof=1)
+
+    # Members carrying signal at each subdomain point (prior). Strict > dbz_min matches the
+    # clamped obs floor, so a fully clear-air point counts 0.
+    n_active_f_sub = (ens_hx_sub > dbz_min).sum(axis=3)
 
     xf_mean = xf_sub.mean(axis=3)
     xa_mean = xa_sub.mean(axis=3)
@@ -150,8 +156,10 @@ def compute_single_obs_metrics(
     err_f_obs = hxf_mean_sub - truth_hx_sub
     err_a_obs = hxa_mean_sub - truth_hx_sub
 
-    # Diagnostic fractional precipitation metric to map storm-edge conditions
-    precip_fraction_f = float((hxf_mean_sub[mask] > 0.0).mean())
+    # Diagnostic fractional precipitation metric to map storm-edge conditions. Thresholded
+    # on the config's dbz_min (not a hardcoded 0) so it stays consistent with the obs floor
+    # the forward operator was clamped to.
+    precip_fraction_f = float((hxf_mean_sub[mask] > dbz_min).mean())
 
     # Nerger (2022)-style non-Gaussianity/skill diagnostics, obs (reflectivity) space
     skew_f_obs_field = ensemble_skew(ens_hx_sub, axis=3)
@@ -174,6 +182,28 @@ def compute_single_obs_metrics(
         inc_obs=float(hxa_mean_sub[i0, j0, k0]) - float(hxf_mean_sub[i0, j0, k0]),
         spread_f_obs=float(ens_hx_sub[i0, j0, k0, :].std(ddof=1)),
         spread_a_obs=float(hxa_sub[i0, j0, k0, :].std(ddof=1)),
+
+        # Canonically-named aliases of spread_{f,a}_obs, matching spread_*_point_{vname}.
+        # The originals are kept so existing notebooks keep resolving.
+        spread_f_point_obs=float(hxf_std_sub[i0, j0, k0]),
+        spread_a_point_obs=float(hxa_std_sub[i0, j0, k0]),
+        spread_f_w_obs=_weighted_spread(hxf_std_sub, weights, Ne),
+        spread_a_w_obs=_weighted_spread(hxa_std_sub, weights, Ne),
+        spread_f_u_obs=_unweighted_spread(hxf_std_sub, mask, Ne),
+        spread_a_u_obs=_unweighted_spread(hxa_std_sub, mask, Ne),
+
+        # Signed error against truth. Distinct from dep_b/dep_a, which are yo - H(x) and so
+        # carry the observation noise; these are H(x) - H(truth).
+        bias_f_point_obs=float(err_f_obs[i0, j0, k0]),
+        bias_a_point_obs=float(err_a_obs[i0, j0, k0]),
+        bias_f_w_obs=_weighted_mean(err_f_obs, weights),
+        bias_a_w_obs=_weighted_mean(err_a_obs, weights),
+        bias_f_u_obs=_unweighted_mean(err_f_obs, mask),
+        bias_a_u_obs=_unweighted_mean(err_a_obs, mask),
+
+        n_active_f_point=float(n_active_f_sub[i0, j0, k0]),
+        n_active_f_w=_weighted_mean(n_active_f_sub.astype(np.float32), weights),
+        n_active_f_u=_unweighted_mean(n_active_f_sub.astype(np.float32), mask),
 
         rmse_f_point_obs=float(np.abs(err_f_obs[i0, j0, k0])),
         rmse_a_point_obs=float(np.abs(err_a_obs[i0, j0, k0])),
@@ -237,6 +267,13 @@ def compute_single_obs_metrics(
         out[f"spread_f_u_{vname}"] = _unweighted_spread(std_f, mask, Ne)
         out[f"spread_a_u_{vname}"] = _unweighted_spread(std_a, mask, Ne)
 
+        # Signed error over the localization volume. The _point_ variants are omitted --
+        # they are mean_{f,a}_point_{vname} - truth_point_{vname}, both stored above.
+        out[f"bias_f_w_{vname}"] = _weighted_mean(err_f, weights)
+        out[f"bias_a_w_{vname}"] = _weighted_mean(err_a, weights)
+        out[f"bias_f_u_{vname}"] = _unweighted_mean(err_f, mask)
+        out[f"bias_a_u_{vname}"] = _unweighted_mean(err_a, mask)
+
         skew_f = ensemble_skew(xf_sub[..., iv], axis=3)
         skew_a = ensemble_skew(xa_sub[..., iv], axis=3)
         kurt_f = ensemble_kurt(xf_sub[..., iv], axis=3)
@@ -270,8 +307,18 @@ def compute_single_obs_metrics(
 def compute_multi_obs_metrics(
         xa, xf, truth,
         hxf_mean_field, hxa_mean_field, truth_hx_field,
-        var_names, Ne, store_fields=False
+        var_names, Ne, store_fields=False,
+        ens_hxf=None, ens_hxa=None, dbz_min=0.0
 ) -> dict:
+    """Full-domain metrics for multi_obs mode.
+
+    `ens_hxf`/`ens_hxa` are the prior/posterior obs-space (reflectivity) ensembles,
+    (nx, ny, nz, Ne). When supplied, reflectivity gets the same metric families as the
+    state variables under the `_ref` suffix; the mean-only fields (err_hxf/residual) are
+    emitted either way. They default to None so a caller that only has the means still
+    works, but the runner always passes them -- without them there is no member axis to
+    reduce and every `*_ref` key would be missing.
+    """
     xf_mean = xf.mean(axis=3)
     xa_mean = xa.mean(axis=3)
     xf_std  = _per_var(lambda e: e.std(axis=3, ddof=1), xf)
@@ -302,6 +349,32 @@ def compute_multi_obs_metrics(
         kurt_a_field = np.full_like(kurt_f_field, np.nan)
         crps_a_field = np.abs(xa_mean - truth)
 
+    # Same diagnostics in obs (reflectivity) space, under the `_ref` suffix. These are
+    # (nx,ny,nz) -- no trailing var axis -- so _per_var does not apply and the reductions
+    # run directly. Each one allocates a (nx,ny,nz,Ne) temporary (np.sort, the abs-diff,
+    # dev**4), i.e. the same peak as one extra state variable; they are freed as we go.
+    ref = {}
+    if ens_hxf is not None:
+        ref["spread_f_ref_field"] = ens_hxf.std(axis=3, ddof=1)
+        ref["skew_f_ref_field"]   = ensemble_skew(ens_hxf, axis=3)
+        ref["kurt_f_ref_field"]   = ensemble_kurt(ens_hxf, axis=3)
+        ref["crps_f_ref_field"]   = crps_ensemble_sorted(ens_hxf, truth_hx_field, axis=3)
+        # Members carrying signal: strict > dbz_min matches the clamped obs floor, so a
+        # fully clear-air point counts 0. int16 is ample for any realistic Ne.
+        ref["n_active_f_field"]   = (ens_hxf > dbz_min).sum(axis=3).astype(np.int16)
+
+        if ens_hxa is not None and ens_hxa.shape[3] > 1:
+            ref["spread_a_ref_field"] = ens_hxa.std(axis=3, ddof=1)
+            ref["skew_a_ref_field"]   = ensemble_skew(ens_hxa, axis=3)
+            ref["kurt_a_ref_field"]   = ensemble_kurt(ens_hxa, axis=3)
+            ref["crps_a_ref_field"]   = crps_ensemble_sorted(ens_hxa, truth_hx_field, axis=3)
+        else:
+            # Degenerate (e.g. Ne=1) posterior: skew/kurt undefined, CRPS -> |x-y|.
+            ref["spread_a_ref_field"] = np.zeros_like(ref["spread_f_ref_field"])
+            ref["skew_a_ref_field"]   = np.full_like(ref["skew_f_ref_field"], np.nan)
+            ref["kurt_a_ref_field"]   = np.full_like(ref["kurt_f_ref_field"], np.nan)
+            ref["crps_a_ref_field"]   = np.abs(residual_field)
+
     out = dict(
         hxf_mean_field=hxf_mean_field, hxa_mean_field=hxa_mean_field,
         truth_hx_field=truth_hx_field,
@@ -319,6 +392,12 @@ def compute_multi_obs_metrics(
         crps_f_field=crps_f_field.astype(np.float32),
         crps_a_field=crps_a_field.astype(np.float32),
     )
+
+    # abs_err/bias in obs space are deliberately not stored as `_ref` fields: they are
+    # exactly err_hxf_field / residual_field (and their abs), already above. Only the
+    # derived `_global_ref` scalars are emitted, so scalar iteration stays uniform.
+    for _k, _v in ref.items():
+        out[_k] = _v.astype(np.float32) if _v.dtype.kind == "f" else _v
 
     if store_fields:
         out["xf"] = xf.astype(np.float32)
@@ -342,5 +421,23 @@ def compute_multi_obs_metrics(
         out[f"kurt_a_global_{vname}"] = _nanmean_quiet(np.abs(kurt_a_field[..., iv]))
         out[f"crps_f_global_{vname}"] = _nanmean_quiet(crps_f_field[..., iv])
         out[f"crps_a_global_{vname}"] = _nanmean_quiet(crps_a_field[..., iv])
+
+    # Reflectivity globals, same reducers as the state loop above so `_global_ref` can be
+    # read alongside `_global_{vname}` for vname in var_names.
+    out["rmse_f_global_ref"] = float(np.sqrt((err_hxf_field ** 2).mean()))
+    out["rmse_a_global_ref"] = float(np.sqrt((residual_field ** 2).mean()))
+    out["bias_f_global_ref"] = float(err_hxf_field.mean())
+    out["bias_a_global_ref"] = float(residual_field.mean())
+
+    if ref:
+        out["spread_f_global_ref"] = float(np.sqrt((Ne+1)/Ne * (ref["spread_f_ref_field"]**2).mean()))
+        out["spread_a_global_ref"] = float(np.sqrt((Ne+1)/Ne * (ref["spread_a_ref_field"]**2).mean()))
+        out["skew_f_global_ref"]   = _nanmean_quiet(np.abs(ref["skew_f_ref_field"]))
+        out["skew_a_global_ref"]   = _nanmean_quiet(np.abs(ref["skew_a_ref_field"]))
+        out["kurt_f_global_ref"]   = _nanmean_quiet(np.abs(ref["kurt_f_ref_field"]))
+        out["kurt_a_global_ref"]   = _nanmean_quiet(np.abs(ref["kurt_a_ref_field"]))
+        out["crps_f_global_ref"]   = _nanmean_quiet(ref["crps_f_ref_field"])
+        out["crps_a_global_ref"]   = _nanmean_quiet(ref["crps_a_ref_field"])
+        out["n_active_f_global"]   = float(ref["n_active_f_field"].mean())
 
     return out

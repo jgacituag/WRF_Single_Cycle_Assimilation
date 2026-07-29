@@ -9,43 +9,52 @@ tempering (TEnKF).
 
 ```
 .
-├── src/
+├── src/                             # everything needed to RUN an experiment
 │   ├── da/
-│   │   ├── metrics.py
-│   │   └── core.py                  # All DA methods (LETKF, TEnKF, AOEI)
+│   │   ├── __init__.py              # package marker (empty, but required)
+│   │   ├── core.py                  # the DA methods: LETKF, TEnKF, AOEI
+│   │   └── metrics.py               # every diagnostic (see "Output files")
 │   ├── runners/
-│   │   └── run_experiment.py        # Unified runner for all experiment modes
-│   ├── extract_3d_subset.py         # Extract WRF ensemble subsets to .npz
-│   ├── build_fortran.sh             # Compiles the Fortran LETKF module
-│   ├── fortran/                     # Fortran LETKF source and compiled .so
-│   ├── queue_ws.sh                  # PBS script for sweep / single_obs mode
-│   ├── queue_ws2.sh                 # PBS script for legacy strided experiment
-│   └── queue_multiobs.sh            # PBS script for multi_obs mode
+│   │   └── run_experiment.py        # the entry point; all three modes
+│   ├── fortran/
+│   │   ├── common_tools.f90         # precision kinds, constants
+│   │   ├── common_mtx.f90           # symmetric eigendecomposition (LAPACK)
+│   │   ├── common_letkf.f90         # letkf_core, one grid point
+│   │   ├── common_da_wloc.f90       # grid loop + R-localization + calc_ref
+│   │   └── f2py_f2cmap.txt          # maps r_size->double, r_sngl->float
+│   ├── build_fortran.sh             # compiles the four .f90 into cletkf_wloc
+│   ├── extract_3d_subset.py         # WRF output -> subset .npz  (data prep)
+│   ├── queue_ws.sh                  # PBS: sweep / single_obs
+│   └── queue_multiobs.sh            # PBS: multi_obs
 ├── configs/
-│   ├── template.yaml                # Full reference template — start here
-│   ├── build_3D_section_wrfout.yaml # Data extraction from raw wrfout files
-│   ├── build_3D_section_post.yaml   # Data extraction from post-processed files
-│   ├── ws_sweep_test.yaml           # Sweep experiment (stride 20, Nt 1–10)
-│   ├── ws_multiobs_<HHMM>.yaml      # Per-sweep multi_obs configs
-│   └── ws_sweep_<HHMM>.yaml         # Per-sweep sweep configs
-├── Notebooks/
-│   ├── S0_Test.ipynb
-│   ├── S1_Explore_and_extract_3d_sections_WRF.ipynb
-│   ├── S2_obs_explorer_ws2.ipynb
-│   ├── S3_sweep_diagnostics_Final.ipynb       # Main diagnostic notebook
-│   ├── S3_Explore_output_single_obs.ipynb
-│   ├── S3_Explore_output_Multy_Obs.ipynb
-│   ├── Plot_Evaluate_output_multiple_obs.ipynb
-│   ├── Plot_Evaluate_3D_multiple_obs.ipynb
-│   └── collector.ipynb
+│   ├── template.yaml                # full documented reference — start here
+│   ├── build_3D_section_post*.yaml  # data extraction from postprocessed files
+│   ├── build_3D_section_wrfout.yaml # data extraction from raw wrfout
+│   └── ws_*.yaml                    # experiment configs (git-ignored)
+├── Notebooks/                       # the analysis layer
+│   ├── nbcommon.py                  # shared helpers + THE sign convention
+│   ├── N1_Prepare_Data.ipynb        # explore WRF output, extract subsets
+│   ├── N2_Prior_Conditions.ipynb    # the prior ensemble (no DA output)
+│   ├── N3_Pointwise_Skill.ipynb     # where assimilation helps and hurts
+│   ├── N4_Method_Comparison.ipynb   # AOEI vs LETKF vs TEnKF Nt=1..5
+│   └── figures/                     # PDF + PNG output of the notebooks
 ├── test/
-│   ├── run_sanity_check.py
-│   └── test_da_core.py
-├── data/                            # Input subsets and output results (git-ignored)
-├── logs/                            # Runtime logs from PBS jobs
+│   ├── test_install.py              # can this checkout run an experiment?
+│   └── test_ensemble_stats.py       # skew / kurtosis / CRPS correctness
+├── data/                            # subsets and results (git-ignored)
+│   ├── 3D_subsets_*/                # prepared prior ensembles
+│   ├── WS_*/                        # experiment output
+│   └── derived/                     # notebook caches and published tables
+├── logs/                            # PBS job logs
 ├── REPO_STRUCTURE.md
 └── environment.yml
 ```
+
+The compiled `cletkf_wloc*.so` is **git-ignored**, so a fresh clone has only the
+`.f90` sources — `build_fortran.sh` is not optional, and the PBS scripts re-run it
+on every compute node. The experiment configs (`configs/ws*`) are git-ignored too;
+the runner copies whichever one it used into the output directory, so each result
+folder is self-describing.
 
 ---
 
@@ -55,8 +64,14 @@ tempering (TEnKF).
 
 ```bash
 conda env create -f environment.yml
-conda activate intermediate_exp
+conda activate wrf_python_assimilation
 ```
+
+> The working environment on this cluster is named `intermediate_exp` (Python 3.8),
+> which is what the PBS scripts and the shipped `.so` were built against.
+> `environment.yml` declares `name: wrf_python_assimilation` and pins no Python
+> version — a fresh env may get a Python that cannot load a prebuilt extension, so
+> always rebuild it (step 2) rather than copying a `.so` between machines.
 
 ### 2. Build the Fortran LETKF module
 
@@ -64,9 +79,20 @@ conda activate intermediate_exp
 bash src/build_fortran.sh
 ```
 
-This compiles `cletkf_wloc` via `f2py` and places the `.so` in `src/fortran/`.
-All runners add that path to `sys.path` automatically.
-The PBS queue scripts re-run this step on each compute node before launching Python.
+Compiles `cletkf_wloc` via `f2py` from the four `.f90` sources and places the `.so`
+in `src/fortran/`. All runners add that path to `sys.path` automatically. Requires
+`CONDA_PREFIX` to be set and `$CONDA_PREFIX/lib/liblapack.so` to exist; the script
+exits with a clear message if not. On this cluster the queue scripts first run
+`source /opt/load-libs.sh 3`.
+
+### 3. Check the installation
+
+```bash
+python test/test_install.py
+```
+
+Data-free and config-free: it builds a tiny synthetic ensemble in memory and runs
+LETKF, TEnKF and AOEI end to end. If this passes, the checkout can run experiments.
 
 ---
 
@@ -75,8 +101,9 @@ The PBS queue scripts re-run this step on each compute node before launching Pyt
 Before running any experiment you need to extract the 3D WRF ensemble subset
 from the raw `wrfout` files or post-processed output.
 
-**Interactive** — open `Notebooks/S1_Explore_and_extract_3d_sections_WRF.ipynb`
-and follow the four steps: choose region → visualise → extract → sanity check.
+**Interactive** — open `Notebooks/N1_Prepare_Data.ipynb`: inspect a source file →
+draw the region on a reflectivity map → get the grid indices for the YAML → extract
+→ verify → health-sweep every subset on disk.
 
 **Command line** — once the appropriate config is configured:
 
@@ -88,12 +115,22 @@ python src/extract_3d_subset.py --config configs/build_3D_section_wrfout.yaml
 python src/extract_3d_subset.py --config configs/build_3D_section_post.yaml
 ```
 
-The output is a compressed `.npz` file with the following arrays:
+The output is a compressed `.npz` file with exactly five `float32` arrays:
 
 | Key | Shape | Description |
 |-----|-------|-------------|
 | `state_ensemble` | `(nx, ny, nz, Ne, 8)` | All members |
+| `lats` / `lons` | `(ny, nx)` | **Transposed relative to the state** |
+| `z_heights` | `(nz, ny, nx)` | Height ASL [m] |
 | `pos_km` | `(nx, ny, nz, 3)` | Position [x_km, y_km, z_km] from domain corner |
+
+Two traps worth stating once. **`lats`/`lons` are `(ny, nx)`** while everything else
+is `(nx, ny, …)` — `nbcommon.map_field` applies the transpose internally so no
+notebook does it by hand. And **`pos_km` is relative to each subset's own corner**,
+so `x_km` from a 3.95 km grid and a 1.98 km grid are not comparable.
+
+**Reflectivity is not stored** and must be derived from `qr/qs/qg/T/P`
+(`nbcommon.hx`, or the Fortran `calc_ref_ens` the assimilation itself uses).
 
 Variable order in the last axis of `state_ensemble`:
 
@@ -137,7 +174,16 @@ toward later iterations; `alpha_s = 0` gives equal weights.
 R-localization (Greybush et al. 2011). The Fortran inflates observation error
 by `exp(0.5*(d/L)^2)` at distance `d` from a grid point with scale `L`.
 Distances and scales are in km, computed from `pos_km`.
-Set `loc_x/y/z: null` to disable localization on an axis.
+
+The compact-support cutoff is **hardcoded** at `d² ≤ (2√(10/3))² ≈ 13.33`, i.e. a
+normalized radius of ≈ 3.65 L, in both `common_da_wloc.f90` and `_compute_rho`.
+It is *not* `cutoff_factor` — that is a separate Python-only subdomain box used by
+sweep and single_obs to keep memory down (see the config reference below).
+
+`loc_x/y/z: null` **does not work** — it raises `TypeError` in `_build_combos`.
+Setting an axis to `0.0` drops it from the distance calculation in Fortran, but in
+sweep mode the Python subdomain box also collapses to one cell on that axis, so the
+two modes then disagree. Use a small positive scale instead.
 
 ---
 
@@ -145,11 +191,9 @@ Set `loc_x/y/z: null` to disable localization on an axis.
 
 ### 1. Sanity check first
 
-Before any full run, verify all methods work correctly on a single point:
-
 ```bash
-python test/run_sanity_check.py --config configs/test_sanity.yaml \
-    --truth 0 --x 10 --y 0 --z 15
+python test/test_install.py          # methods run, AOEI inflates, bounds hold
+python test/test_ensemble_stats.py   # skew / kurtosis / CRPS against closed forms
 ```
 
 ### 2. Observation modes
@@ -213,40 +257,60 @@ every output folder is self-contained.
 {tag}_sweep_Ne{ne:03d}_tm{tm:02d}.npz
 ```
 
-Loaded with `np.load(..., allow_pickle=True)['arr_0']` → a NumPy array of
-row dicts, one per QC-passing observation point. Each row contains:
+Loaded with `np.load(...)` → **flat 1-D columns**, one element per
+(observation point × method combo) row, so `d["rmse_a_w_w"][n]` pairs with
+`d["i"][n]`, `d["method"][n]`, etc. All metric columns are `float32`.
 
-**Obs-space point metrics:**
+Every metric family comes in three spatial reductions, encoded as the infix:
+
+| Infix | Meaning |
+|-------|---------|
+| `_point_` | value at the observation grid point |
+| `_w_` | localization-weighted mean over the subdomain (weights = `rho`) |
+| `_u_` | unweighted mean over the cutoff zone (`rho > 0`) |
+
+> Note the `w`/`u` infixes collide visually with the state variables also named
+> `w` and `u`. The variable suffix is always **last**: `crps_f_w_w` is the
+> weighted CRPS of vertical wind, `rmse_f_u_u` the unweighted RMSE of `u`.
+
+**Row metadata:** `i, j, k` (grid index), `x_km, y_km, z_km`, `yo`, `yo_clean`,
+`method`, `ntemp`, `alpha_s`, `lx_km, ly_km, lz_km`, plus a `var_names` array
+`['qg','qr','qs','T','P','u','v','w','ref']`.
+
+**Obs-space (reflectivity) metrics** — suffix `_obs`:
 
 | Key | Description |
 |-----|-------------|
 | `yo` | Noisy observation [dBZ] |
 | `yo_clean` | Noise-free truth H(x) [dBZ] |
-| `dep_b` | Prior innovation `yo − H(x̄ᶠ)` [dBZ] |
-| `dep_a` | Posterior residual `yo − H(x̄ᵃ)` [dBZ] |
-| `hxf_mean_obs` | Prior ensemble mean at obs point [dBZ] |
-| `hxa_mean_obs` | Posterior ensemble mean at obs point [dBZ] |
+| `dep_b` / `dep_a` | Prior innovation / posterior residual `yo − H(x̄)` [dBZ] |
+| `hxf_mean_obs` / `hxa_mean_obs` | Prior/posterior ensemble mean at obs point [dBZ] |
 | `inc_obs` | Analysis increment at obs point [dBZ] |
-| `spread_f_obs` | Prior ensemble spread at obs point [dBZ] |
-| `spread_a_obs` | Posterior ensemble spread at obs point [dBZ] |
-| `rmse_f/a_point_obs` | Abs error at obs point (prior/posterior) |
-| `rmse_f/a_w_obs` | Weighted RMSE in obs space over localization volume |
-| `rmse_f/a_u_obs` | Unweighted RMSE in obs space over localization volume |
+| `rmse_f/a_{point,w,u}_obs` | Abs error / RMSE vs `truth_hx` |
+| `bias_f/a_{point,w,u}_obs` | Signed error `H(x̄) − H(truth)`; unlike `dep_*` this carries no obs noise |
+| `spread_f/a_{point,w,u}_obs` | Ensemble spread [dBZ] |
+| `skew_f/a_{point,w,u}_obs` | Ensemble skewness (Nerger 2022 Eq. 25); `_w`/`_u` average `\|skew\|` |
+| `kurt_f/a_{point,w,u}_obs` | Excess kurtosis (Nerger 2022 Eq. 26); `_w`/`_u` average `\|kurt\|` |
+| `crps_f/a_{point,w,u}_obs` | Ensemble CRPS vs `truth_hx` [dBZ] |
+| `n_active_f_{point,w,u}` | Members with signal (`H(x) > dbz_min`), of `Ne` |
 | `loc_weights_sum` | Sum of localization weights |
-| `n_updated` | Number of grid points updated (rloc > 0) |
-| `precip_fraction_f` | Fraction of updated points with H(x̄ᶠ) > 0 |
+| `n_updated` | Number of grid points updated (`rloc > 0`) |
+| `precip_fraction_f` | Fraction of updated points with `H(x̄ᶠ) > dbz_min` |
 | `hx_dbz_local_mean_w/u` | Weighted/unweighted mean reflectivity in localization volume |
+| `spread_f/a_obs` | Legacy aliases of `spread_f/a_point_obs`, kept for older notebooks |
 
 **Per state variable** (for each var in `{qg, qr, qs, T, P, u, v, w}`):
 
 | Key pattern | Description |
 |-------------|-------------|
-| `rmse_f/a_point_{var}` | Abs error at obs point |
-| `rmse_f/a_w_{var}` | Weighted RMSE over localization volume |
-| `rmse_f/a_u_{var}` | Unweighted RMSE over localization volume |
-| `spread_f/a_point_{var}` | Ensemble spread at obs point |
-| `spread_f/a_w_{var}` | Weighted ensemble spread over localization volume |
-| `spread_f/a_u_{var}` | Unweighted ensemble spread over localization volume |
+| `mean_f/a_point_{var}` | Signed ensemble-mean state value at obs point |
+| `truth_point_{var}` | Truth value at obs point |
+| `rmse_f/a_{point,w,u}_{var}` | Abs error / RMSE |
+| `bias_f/a_{w,u}_{var}` | Signed error `x̄ − truth`. No `_point_` variant: it is `mean_*_point_{var} − truth_point_{var}` |
+| `spread_f/a_{point,w,u}_{var}` | Ensemble spread |
+| `skew_f/a_{point,w,u}_{var}` | Ensemble skewness; `_w`/`_u` average `\|skew\|` |
+| `kurt_f/a_{point,w,u}_{var}` | Excess kurtosis; `_w`/`_u` average `\|kurt\|` |
+| `crps_f/a_{point,w,u}_{var}` | Ensemble CRPS vs truth |
 
 ### Multi-obs mode
 
@@ -255,18 +319,45 @@ row dicts, one per QC-passing observation point. Each row contains:
 {tag}_multi_obs_{method}_Nt{nt:02d}_as{alpha_s}_Lx{lx}Ly{ly}Lz{lz}_Ne{ne:03d}_tm{tm:02d}.npz
 ```
 
-| Key | Description |
-|-----|-------------|
-| `xa` | Posterior ensemble `(nx, ny, nz, Ne, nvar)` |
-| `hxf_mean_field` | Prior ensemble-mean reflectivity field |
-| `hxa_mean_field` | Posterior ensemble-mean reflectivity field |
-| `residual_field` | `hxa_mean − truth_hx` |
-| `abs_err_f/a_field` | Absolute state error (prior/posterior) |
-| `bias_f/a_field` | Signed state bias |
-| `spread_f/a_field` | Ensemble spread field |
-| `rmse_f/a_global_{var}` | Domain-wide RMSE per state variable |
-| `bias_f/a_global_{var}` | Domain-wide bias per state variable |
-| `spread_f/a_global_{var}` | Domain-wide spread per state variable |
+State-variable fields carry a trailing variable axis of size 8, ordered
+`[qg, qr, qs, T, P, u, v, w]` — the `var_names` array in the file. Reflectivity is
+**not** a 9th slot on that axis; it uses separate `_ref`-suffixed keys with no
+variable axis, so state-field shapes are the same as they have always been.
+
+| Key | Shape | Description |
+|-----|-------|-------------|
+| `hxf_mean_field` / `hxa_mean_field` | `(nx,ny,nz)` | Prior/posterior ensemble-mean reflectivity |
+| `truth_hx_field` | `(nx,ny,nz)` | Truth reflectivity |
+| `err_hxf_field` / `residual_field` | `(nx,ny,nz)` | `hx{f,a}_mean − truth_hx` |
+| `abs_err_f/a_field` | `(nx,ny,nz,8)` | Absolute state error |
+| `bias_f/a_field` | `(nx,ny,nz,8)` | Signed state bias |
+| `spread_f/a_field` | `(nx,ny,nz,8)` | Ensemble spread |
+| `skew_f/a_field` | `(nx,ny,nz,8)` | Ensemble skewness (Nerger 2022 Eq. 25) |
+| `kurt_f/a_field` | `(nx,ny,nz,8)` | Excess kurtosis (Nerger 2022 Eq. 26) |
+| `crps_f/a_field` | `(nx,ny,nz,8)` | Ensemble CRPS vs truth |
+| `spread_f/a_ref_field` | `(nx,ny,nz)` | Reflectivity ensemble spread [dBZ] |
+| `skew_f/a_ref_field` | `(nx,ny,nz)` | Reflectivity ensemble skewness |
+| `kurt_f/a_ref_field` | `(nx,ny,nz)` | Reflectivity excess kurtosis |
+| `crps_f/a_ref_field` | `(nx,ny,nz)` | Reflectivity ensemble CRPS [dBZ] |
+| `n_active_f_field` | `(nx,ny,nz)` `int16` | Prior members with signal (`H(x) > dbz_min`), of `Ne` |
+| `xf`, `xa`, `truth_state` | `(nx,ny,nz,Ne,8)` | Only when `store_fields: true` (off by default) |
+
+Domain-wide scalars, for each var in `{qg, qr, qs, T, P, u, v, w}` **and** `ref`:
+
+| Key pattern | Description |
+|-------------|-------------|
+| `rmse_f/a_global_{var\|ref}` | Domain-wide RMSE |
+| `bias_f/a_global_{var\|ref}` | Domain-wide bias |
+| `spread_f/a_global_{var\|ref}` | Domain-wide spread |
+| `skew_f/a_global_{var\|ref}` | Domain mean of `\|skew\|`, non-finite cells dropped |
+| `kurt_f/a_global_{var\|ref}` | Domain mean of `\|kurt\|`, non-finite cells dropped |
+| `crps_f/a_global_{var\|ref}` | Domain-mean CRPS |
+| `n_active_f_global` | Domain-mean count of members with signal |
+
+`abs_err`/`bias` have no `_ref_field` counterpart: they are exactly
+`abs(err_hxf_field)` and `err_hxf_field`, already in the file. The
+`{rmse,bias}_f/a_global_ref` scalars are still emitted so the scalar naming stays
+uniform across `var_names + ["ref"]`.
 
 **Reference file** (shared across all combos for one truth member):
 ```
@@ -290,6 +381,72 @@ row dicts, one per QC-passing observation point. Each row contains:
 
 ---
 
+## Analysis
+
+Four notebooks, meant to be read in order. They are configuration plus narrative —
+everything mechanical lives in `Notebooks/nbcommon.py`.
+
+| Notebook | Reads | Question |
+|---|---|---|
+| **N1** `Prepare_Data` | raw WRF output | What is in the source files, and which subset do we extract? |
+| **N2** `Prior_Conditions` | `3D_subsets_*` **only** | What does the forecast ensemble look like before any observation is used? |
+| **N3** `Pointwise_Skill` | sweep output | Where does assimilation improve, where does it degrade, and can the prior predict which? |
+| **N4** `Method_Comparison` | sweep output | Which method wins — AOEI, LETKF, or TEnKF at Nt = 1…5? |
+
+N2 deliberately touches **no** assimilation output, so it can be run before the
+experiments and is what selects the hour and sub-box they target.
+
+### The sign convention
+
+`nbcommon` owns one rule, and enforces it:
+
+> Every quantity named **skill** is `prior − analysis`.
+> **Positive means the analysis is better.**
+
+There is no other difference in the module — no `drmse`, no `delta`. `skill()` is
+the only function that subtracts, `skill_label()` generates the axis text from the
+same call chain as the numbers, `CMAP_SKILL` is fixed blue-positive, and
+`assert_convention()` runs **at import**, so flipping the sign breaks every notebook
+at once rather than producing a plausible wrong figure.
+
+`spread` is not a skill metric and `skill(metric='spread')` raises.
+`bias`, `skew` and `kurt` are compared as magnitudes.
+
+### Why N3 and N4 cannot disagree
+
+Both notebooks call exactly one chain:
+
+```
+nb.load_runs(...) -> nb.align(df, combos) -> nb.skill_summary(aligned, metric, var, red)
+```
+
+`align()` inner-joins every method combo on a stable point key, so both notebooks
+necessarily aggregate over the *same* intersected point set, and it reports the NaN
+count per combo — divergent NaN rates are the likeliest real cause of two analyses
+of the same data reaching opposite conclusions. N3 ends by publishing its headline
+table; N4 cell 5 re-derives it and compares against both the published CSV and the
+digest, raising `ConsistencyError` with a row-aligned diff if they differ. N4's
+final cell re-derives every prose conclusion as a PASS/FAIL audit.
+
+### Pointing N3 and N4 at a run
+
+Both notebooks take their run list from a single `RUNS` literal in cell 2:
+
+```python
+RUNS = [dict(tag="WS_<your_sweep_L0.1>", loc=0.1, hour="18"),
+        dict(tag="WS_<your_sweep_L2.0>", loc=2.0, hour="18")]
+```
+
+`tag` is the output directory name under `data/`. **N4 must use the same literal as
+N3** — that is what the cross-check verifies. Run N3 first: it publishes
+`data/derived/N3_headline.csv` and prints a digest to paste into N4 cell 2.
+
+`nbcommon.load_sweep` warns if a file does not have 362 columns, which means it
+predates the reflectivity-metrics change and will be missing the `_ref`,
+`n_active` and `bias_*` columns N3 and N4 depend on.
+
+---
+
 ## Config reference
 
 See `configs/template.yaml` for the full documented reference with all
@@ -299,12 +456,48 @@ options, accepted formats, and defaults. Key points:
 - `obs.add_noise: true` adds N(0, √obs_error_var) noise to synthetic observations
 - `prior_size: null` uses all remaining members (default); set to integer for ensemble size sensitivity
 - Sweep parameters accept scalar, list, or `{start, stop, num}` (stop inclusive)
-- `loc_x/y/z: null` disables localization (equivalent to L=99999)
+- `loc_x/y/z: null` **raises** — see the localization note above
 - `qc.clamp_obs: true` clamps observations to the ensemble H(x) range
 - `qc.filter_variance: true` enables variance-based obs point selection
 - `skip_existing: true` resumes a partial run without recomputing finished files
 - `verbose: 1` is recommended for cluster runs (one line per truth member)
-- `store_fields: true` (single_obs only) saves `xf_sub`, `truth_sub`, and `xa_sub`
+- `store_fields: true` saves the full ensembles; off by default because it is large
+- `cutoff_factor` (default 4.0) is a **sweep / single_obs memory optimization only**.
+  It sizes the Python subdomain box handed to Fortran; `_run_multi_obs` never reads
+  it. Values below ≈ 3.65 would silently truncate both the analysis and the metric
+  masks, so leave it at 4.0.
+
+### Two traps when writing a sweep matrix
+
+`_build_combos` takes the **Cartesian product** of `loc_x × loc_y × loc_z`. Writing
+
+```yaml
+loc_x: [0.1, 2.0]
+loc_y: [0.1, 2.0]
+loc_z: [0.1, 2.0]
+```
+
+gives **8** combinations with mixed `lx ≠ ly ≠ lz`, not the 2 isotropic ones
+intended. Run each localization scale as its own config into its own output
+directory.
+
+Keep `alpha_s` **scalar**. `LETKF` and `AOEI` de-duplicate on
+`(method, alpha_s, lx, ly, lz)` and have `ntemp` forced to 1, so a *list* of
+`alpha_s` produces duplicate rows differing only in a field that is not part of the
+point key — which `nbcommon.align()` refuses to align, deliberately.
+
+---
+
+## Testing
+
+| Command | Needs data? | Checks |
+|---|---|---|
+| `python test/test_install.py` | no | Fortran extension imports; `calc_ref` / `calc_ref_ens` agree; LETKF / TEnKF / AOEI run, stay finite, keep hydrometeors ≥ 0 and move toward the observation; AOEI inflates and respects its floor; tempering schedule sums to 1 |
+| `python test/test_ensemble_stats.py` | no | Skewness and excess kurtosis against exact closed forms (Nerger 2022); the O(Ne log Ne) CRPS against the O(Ne²) pairwise reference; both metric entry points for shape, NaN handling and the Ne=1 degenerate case |
+
+`nbcommon` self-tests on import: `assert_convention()` checks the sign of `skill()`
+and the two column-naming hazards, so a broken convention fails every notebook
+immediately rather than producing a plausible wrong figure.
 
 ---
 
@@ -313,3 +506,7 @@ options, accepted formats, and defaults. Key points:
 - LETKF nonlinearity concentrates at high reflectivity (> 40 dBZ)
 - AOEI ≈ TEnKF(Nt=1) in the linear regime
 - Tempering shows diminishing returns beyond Nt = 5
+
+These are prior findings from earlier experiment rounds, not claims re-derived by
+the current notebooks. N4's closing cell audits its own conclusions against whatever
+output it was run on; treat that audit, not this list, as the current state.

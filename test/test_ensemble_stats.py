@@ -140,12 +140,42 @@ def test_single_obs_metrics_smoke():
     out = compute_single_obs_metrics(
         xf_sub, xa_sub, truth_sub, ens_hx_sub, hxa_sub, truth_hx_sub,
         rloc, ox_s=3, oy_s=3, oz_s=2, yo=20.0, yo_clean=20.0, var_names=var_names, Ne=Ne,
+        dbz_min=0.0,
     )
     assert np.isnan(out["skew_f_point_qg"])          # exactly at the zero-variance point
     assert np.isfinite(out["skew_f_w_qg"])            # NaN-guard excludes it from the local mean
     assert np.isfinite(out["crps_f_point_obs"])
     assert np.isfinite(out["kurt_a_u_w"])
+
+    # obs-space spread over the localization volume, and the point aliases
+    for k in ("spread_f_w_obs", "spread_a_w_obs", "spread_f_u_obs", "spread_a_u_obs"):
+        assert np.isfinite(out[k]), k
+    assert np.isclose(out["spread_f_point_obs"], out["spread_f_obs"])
+    assert np.isclose(out["spread_a_point_obs"], out["spread_a_obs"])
+
+    # bias family: signed, and distinct from the noise-carrying dep_b
+    for k in ("bias_f_point_obs", "bias_a_w_obs", "bias_f_u_obs",
+              "bias_f_w_qg", "bias_a_u_w"):
+        assert np.isfinite(out[k]), k
+    # the omitted state-side bias_*_point_* is recoverable from the stored mean/truth
+    assert np.isclose(abs(out["mean_f_point_T"] - out["truth_point_T"]),
+                      out["rmse_f_point_T"])
+
+    # n_active: ens_hx_sub is uniform(0, 40) so every member is above a 0 floor
+    assert out["n_active_f_point"] == Ne
+    assert np.isclose(out["n_active_f_w"], Ne)
     print(f"PASS  compute_single_obs_metrics: {len(out)} keys, NaN-guard + finiteness OK")
+
+    # all members below the floor -> zero members carrying signal, and precip_fraction 0
+    out0 = compute_single_obs_metrics(
+        xf_sub, xa_sub, truth_sub, ens_hx_sub, hxa_sub, truth_hx_sub,
+        rloc, ox_s=3, oy_s=3, oz_s=2, yo=20.0, yo_clean=20.0, var_names=var_names, Ne=Ne,
+        dbz_min=100.0,
+    )
+    assert out0["n_active_f_point"] == 0
+    assert out0["n_active_f_u"] == 0.0
+    assert out0["precip_fraction_f"] == 0.0
+    print("PASS  compute_single_obs_metrics: n_active/precip_fraction honour dbz_min")
 
 
 def test_multi_obs_metrics_smoke():
@@ -155,24 +185,71 @@ def test_multi_obs_metrics_smoke():
     xf = rng.normal(0, 1, (nx, ny, nz, Ne, len(var_names))).astype(np.float32)
     xa = xf * 0.7 + rng.normal(0, 0.3, xf.shape).astype(np.float32)
     truth = rng.normal(0, 1, (nx, ny, nz, len(var_names))).astype(np.float32)
-    hxf_mean_field = rng.uniform(0, 40, (nx, ny, nz)).astype(np.float32)
-    hxa_mean_field = hxf_mean_field * 0.8
+    # clear-air floor in ~1/3 of members so n_active is neither 0 nor Ne everywhere
+    ens_hxf = rng.uniform(0, 40, (nx, ny, nz, Ne)).astype(np.float32)
+    ens_hxf[..., :10] = 0.0
+    ens_hxa = np.clip(ens_hxf * 0.8 + rng.normal(0, 2, ens_hxf.shape), 0.0, None).astype(np.float32)
+    hxf_mean_field = ens_hxf.mean(axis=3)
+    hxa_mean_field = ens_hxa.mean(axis=3)
     truth_hx_field = rng.uniform(0, 40, (nx, ny, nz)).astype(np.float32)
 
     out = compute_multi_obs_metrics(xa, xf, truth, hxf_mean_field, hxa_mean_field,
-                                     truth_hx_field, var_names, Ne=Ne, store_fields=False)
+                                     truth_hx_field, var_names, Ne=Ne, store_fields=False,
+                                     ens_hxf=ens_hxf, ens_hxa=ens_hxa, dbz_min=0.0)
     assert out["skew_f_field"].shape == (nx, ny, nz, len(var_names))
     assert out["crps_f_field"].shape == (nx, ny, nz, len(var_names))
     assert np.isfinite(out["crps_f_global_w"])
+
+    # reflectivity gets the same families under the _ref suffix, as (nx,ny,nz) fields
+    for k in ("spread_f_ref_field", "spread_a_ref_field", "skew_f_ref_field",
+              "skew_a_ref_field", "kurt_f_ref_field", "kurt_a_ref_field",
+              "crps_f_ref_field", "crps_a_ref_field"):
+        assert out[k].shape == (nx, ny, nz), (k, out[k].shape)
+        assert out[k].dtype == np.float32, (k, out[k].dtype)
+    for k in ("rmse_f_global_ref", "rmse_a_global_ref", "bias_f_global_ref",
+              "bias_a_global_ref", "spread_f_global_ref", "spread_a_global_ref",
+              "skew_f_global_ref", "skew_a_global_ref", "kurt_f_global_ref",
+              "kurt_a_global_ref", "crps_f_global_ref", "crps_a_global_ref",
+              "n_active_f_global"):
+        assert np.isfinite(out[k]), k
+
+    # the _ref scalars must agree with the mean-only fields already stored
+    assert np.isclose(out["bias_f_global_ref"], out["err_hxf_field"].mean(), rtol=1e-5)
+    assert np.isclose(out["rmse_f_global_ref"],
+                      np.sqrt((out["err_hxf_field"] ** 2).mean()), rtol=1e-5)
+    assert np.isclose(out["bias_a_global_ref"], out["residual_field"].mean(), rtol=1e-5)
+
+    # obs-space CRPS must match the O(Ne^2) pairwise oracle, same guard the state path has
+    assert np.allclose(out["crps_f_ref_field"],
+                       crps_ensemble(ens_hxf, truth_hx_field, axis=3), atol=1e-4)
+
+    # n_active: 10 of Ne members are exactly at the floor, so a strict > 0 counts Ne-10
+    assert out["n_active_f_field"].dtype == np.int16
+    assert out["n_active_f_field"].shape == (nx, ny, nz)
+    assert out["n_active_f_field"].min() >= 0 and out["n_active_f_field"].max() <= Ne
+    assert (out["n_active_f_field"] == Ne - 10).all()
     print(f"PASS  compute_multi_obs_metrics: {len(out)} keys, shapes/finiteness OK")
 
     # Ne=1 analysis ensemble: skew/kurt undefined (NaN), CRPS still well-defined
     out1 = compute_multi_obs_metrics(xa[:, :, :, :1, :], xf, truth, hxf_mean_field,
                                       hxa_mean_field, truth_hx_field, var_names, Ne=1,
-                                      store_fields=False)
+                                      store_fields=False,
+                                      ens_hxf=ens_hxf, ens_hxa=ens_hxa[:, :, :, :1],
+                                      dbz_min=0.0)
     assert np.isnan(out1["skew_a_global_w"])
     assert np.isfinite(out1["crps_a_global_w"])
+    assert np.isnan(out1["skew_a_global_ref"])
+    assert np.isnan(out1["kurt_a_global_ref"])
+    assert np.isfinite(out1["crps_a_global_ref"])
+    assert out1["spread_a_global_ref"] == 0.0
     print("PASS  compute_multi_obs_metrics: Ne=1 degenerate analysis ensemble handled correctly")
+
+    # means-only call (ens_hxf omitted) still works, just without the _ref block
+    out2 = compute_multi_obs_metrics(xa, xf, truth, hxf_mean_field, hxa_mean_field,
+                                      truth_hx_field, var_names, Ne=Ne, store_fields=False)
+    assert "crps_f_ref_field" not in out2
+    assert np.isfinite(out2["bias_f_global_ref"])   # mean-only scalars still emitted
+    print("PASS  compute_multi_obs_metrics: means-only call degrades to no _ref fields")
 
 
 if __name__ == "__main__":
