@@ -40,7 +40,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.colors import BoundaryNorm, LinearSegmentedColormap, TwoSlopeNorm
-
+import matplotlib.ticker as mticker
 __version__ = "1.0"
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -64,8 +64,10 @@ SIGN CONVENTION -- one rule, enforced by this module.
   (skew/kurt at the _w_/_u_ reductions are already stored as means of |.|, so the
   magnitude is not taken twice; see da/metrics.py.)
 
-  Colour: CMAP_SKILL is blue at positive (better), red at negative (worse), always
-  centred on 0. It is used with skill() output and nothing else.
+  Colour: CMAP_SKILL is RdBu_r -- RED at positive (better), blue at negative
+  (worse), always centred on 0. Red-is-better is not the reading a meteorology
+  audience brings by default, so every caption that uses it says so. It is used
+  with skill() output and nothing else.
 
   Column names are NATIVE and the variable suffix is LAST:
       crps_f_w_w   = loc-weighted CRPS of vertical wind
@@ -185,8 +187,10 @@ def set_style():
         "grid.alpha": 0.30,
         "pdf.fonttype": 42,   # embed TrueType, journal-safe
         "ps.fonttype": 42,
+        'savefig.facecolor': 'white',
+        'figure.facecolor': 'white',
+        'axes.facecolor': 'white',
     })
-
 
 set_style()
 
@@ -218,15 +222,21 @@ DBZ_CMAP = "Spectral_r"
 DBZ_NORM = BoundaryNorm(DBZ_LEVELS, plt.get_cmap(DBZ_CMAP).N)
 
 # CVD-validated sequential + diverging maps.
-C_NT2, C_NT1, C_NONE, C_PRIOR = "#2a78d6", "#eb6834", "#1baf7a", "#52514e"
+C_NT2, C_NT1, C_NONE, C_PRIOR = "#8B0000", "#008080", "#FF8C00", "#4682B4"
 _SEQ_BLUE = ["#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec", "#5598e7",
              "#3987e5", "#2a78d6", "#256abf", "#1c5cab", "#184f95", "#104281", "#0d366b"]
 CMAP_SEQ = LinearSegmentedColormap.from_list("seq_blue", _SEQ_BLUE)
-CMAP_DIV = LinearSegmentedColormap.from_list("div_red_blue", ["#e34948", "#f0efec", C_NT2])
-# CMAP_SKILL: blue = positive = better. Used with skill() output and nothing else.
+CMAP_SEQ.set_bad("#ffffff", alpha=0.0)
+# THE diverging map, for skill and for increments alike: RdBu_r, RED AT POSITIVE.
+# It is the stock map rather than a hand-rolled one because scales() and sym_scale()
+# already return RdBu_r for wind and increment panels -- two diverging maps in one
+# chapter is how a reader learns that colour carries no fixed meaning. Left as a name,
+# not a Colormap instance: mutating the registered instance (set_bad) would change it
+# for every other user of "RdBu_r" in the process, and its default bad colour is
+# already fully transparent, which is what the NaN cells need.
+CMAP_DIV = "RdBu_r"
+# CMAP_SKILL: red = positive = better. Used with skill() output and nothing else.
 CMAP_SKILL = CMAP_DIV
-for _cm in (CMAP_SEQ, CMAP_DIV):
-    _cm.set_bad("#ffffff", alpha=0.0)
 
 _LOC_PALETTE = {0.1: "#d62728", 0.5: "#ff7f0e", 1.0: "#2ca02c", 2.0: "#1f77b4",
                 3.0: "#9467bd", 4.0: "#8c564b", 5.0: "#e377c2"}
@@ -255,7 +265,7 @@ HYDRO = ("qg", "qr", "qs")
 RAW_UNITS = dict(qg="kg/kg", qr="kg/kg", qs="kg/kg", T="K", P="Pa",
                  u="m/s", v="m/s", w="m/s", obs="dBZ")
 UNITS = {"qg": "g kg$^{-1}$", "qr": "g kg$^{-1}$", "qs": "g kg$^{-1}$",
-         "T": "K", "P": "Pa", "u": "m s$^{-1}$", "v": "m s$^{-1}$",
+         "T": "K", "P": "hPa", "u": "m s$^{-1}$", "v": "m s$^{-1}$",
          "w": "m s$^{-1}$", "obs": "dBZ"}
 # Per-variable physical tolerance: the scale below which a difference is a tie, not
 # a result. Used by skill_summary to resolve ties instead of a bare `> 0`.
@@ -269,6 +279,8 @@ VAR_CMAPS = {"qg": "Purples", "qr": "Blues", "qs": "Greys", "T": "YlOrRd",
 
 def disp(x, v):
     """Raw value -> display units (hydrometeors kg/kg -> g/kg, else identity)."""
+    if v == "P":
+        return np.asarray(x) / 1e2
     return np.asarray(x) * 1e3 if v in HYDRO else np.asarray(x)
 
 
@@ -476,6 +488,38 @@ def load_ensemble(path, members=None, ivars=None, bbox=None):
         return np.ascontiguousarray(arr)
 
 
+def _src_stamp(path):
+    """Size and mtime of the source npz, stored inside every cache file."""
+    st = os.stat(path)
+    return {"_src_size": np.int64(st.st_size), "_src_mtime": np.float64(st.st_mtime)}
+
+
+def _load_cached(cf, path, verbose=True):
+    """Cached dict, or None if there is no cache or its source has since changed.
+
+    The cache key is built from the *path*, so re-extracting a subset in place --
+    which N1 does whenever a job is re-run -- would otherwise keep serving the
+    statistics of the file that used to be there. Caches written before this stamp
+    existed carry no `_src_*` keys and are trusted, as they always were.
+    """
+    if not cf.exists():
+        return None
+    with np.load(cf) as f:
+        d = {k: f[k] for k in f.files}
+    size, mtime = d.pop("_src_size", None), d.pop("_src_mtime", None)
+    if size is not None:
+        st = os.stat(path)
+        if int(size) != st.st_size or abs(float(mtime) - st.st_mtime) > 1.0:
+            if verbose:
+                print(f"  {cf.name}: source changed since it was cached; recomputing")
+            return None
+    return d
+
+
+def _save_cached(cf, out, path):
+    np.savez_compressed(cf, **out, **_src_stamp(path))
+
+
 def _cache_key(path, bbox, min_dbz):
     b = "full" if bbox is None else f"{bbox[0].start}_{bbox[0].stop}_{bbox[1].start}_{bbox[1].stop}"
     h = hashlib.sha1(f"{os.path.abspath(path)}|{b}|{min_dbz}".encode()).hexdigest()[:12]
@@ -491,9 +535,10 @@ def prior_stats(path, bbox=None, min_dbz=0.0, cache=True, verbose=True):
     multi-GB decompress.
     """
     cf = _cache_key(path, bbox, min_dbz)
-    if cache and cf.exists():
-        with np.load(cf) as f:
-            return {k: f[k] for k in f.files}
+    if cache:
+        hit = _load_cached(cf, path, verbose=verbose)
+        if hit is not None:
+            return hit
 
     if verbose:
         print(f"computing prior_stats for {os.path.basename(os.path.dirname(path))} "
@@ -517,10 +562,157 @@ def prior_stats(path, bbox=None, min_dbz=0.0, cache=True, verbose=True):
     del ens, dbz
 
     if cache:
-        np.savez_compressed(cf, **out)
+        _save_cached(cf, out, path)
         if verbose:
             print(f"  cached -> {cf.name}")
     return out
+
+
+def section_stats(path, j, min_dbz=0.0, cache=True, verbose=True):
+    """Per-member reflectivity on one j row -> (nx, nz, Ne), plus its moments.
+
+    prior_stats keeps the members only after the column max is taken, so a vertical
+    section can be drawn from the ensemble mean but not from what the members
+    actually produce. This pays one more decompress for a single row and keeps
+    everything: (nx, nz, Ne) is ~0.8 MB for a 307 x 11 x 60 subset, so the whole
+    per-member section fits in the cache and any further statistic is free.
+
+    Returns dbz_members plus dbz_mean / dbz_max / dbz_spread / n_active /
+    dbz_skew / dbz_kurt, all (nx, nz), and the state variables' row mean/spread.
+    """
+    h = hashlib.sha1(f"{os.path.abspath(path)}|{int(j)}|{min_dbz}".encode()).hexdigest()[:12]
+    cf = DERIVED / f"section_{os.path.basename(os.path.dirname(path))}_j{int(j)}_{h}.npz"
+    if cache:
+        hit = _load_cached(cf, path, verbose=verbose)
+        if hit is not None:
+            return hit
+
+    if verbose:
+        print(f"computing section_stats j={j} for "
+              f"{os.path.basename(os.path.dirname(path))} (uncached; decompressing) ...")
+    # The npz inflates whole either way; the row slice is what stays resident.
+    ens = load_ensemble(path, bbox=(slice(None), slice(int(j), int(j) + 1)))
+    ens = ens[:, 0]                                          # (nx, nz, Ne, 8)
+    dbz = hx(ens, min_dbz=min_dbz).astype(np.float32)        # (nx, nz, Ne)
+
+    out = {
+        "dbz_members": dbz,
+        "dbz_mean": dbz.mean(axis=2).astype(np.float32),
+        "dbz_max": dbz.max(axis=2).astype(np.float32),
+        "dbz_spread": dbz.std(axis=2, ddof=1).astype(np.float32),
+        "n_active": (dbz > min_dbz).sum(axis=2).astype(np.int16),
+        "dbz_skew": ensemble_skew(dbz, axis=2).astype(np.float32),
+        "dbz_kurt": ensemble_kurt(dbz, axis=2).astype(np.float32),
+        "j": np.int32(j),
+        "Ne": np.int32(ens.shape[2]),
+        "min_dbz": np.float32(min_dbz),
+    }
+    for v in VARS:
+        out[f"mean_{v}"] = ens[..., VI[v]].mean(axis=2).astype(np.float32)
+        out[f"spread_{v}"] = ens[..., VI[v]].std(axis=2, ddof=1).astype(np.float32)
+    del ens, dbz
+
+    if cache:
+        _save_cached(cf, out, path)
+        if verbose:
+            print(f"  cached -> {cf.name}")
+    return out
+
+
+# The reflectivity histogram grid. hx() clamps at min_dbz, so min_dbz is the floor
+# and everything below it piles into the first bin; 0.25 dBZ is fine enough that any
+# coarser binning, quantile or exceedance fraction can be taken from the counts.
+DBZ_HIST_EDGES = np.arange(0.0, 80.0 + 0.25, 0.25)
+
+
+def dbz_histogram(path, edges=None, min_dbz=0.0, bbox=None, cache=True, verbose=True):
+    """Counts of every per-member reflectivity value in one subset.
+
+    prior_stats keeps moments and column maxima, so the *distribution* of H(x) over
+    the full (nx, ny, nz, Ne) field cannot be recovered from its cache. This pays
+    one more decompress and keeps only the counts: ~3 kB per file, against the
+    1.3 GB the reflectivity field itself would need, and enough to draw any
+    histogram, quantile or exceedance fraction afterwards.
+
+    Returns counts (len(edges) - 1), edges, n_total, n_below and n_above -- the two
+    tails being values outside the binned range, so the counts always add up.
+    """
+    edges = DBZ_HIST_EDGES if edges is None else np.asarray(edges, float)
+    b = "full" if bbox is None else f"{bbox[0].start}_{bbox[0].stop}_{bbox[1].start}_{bbox[1].stop}"
+    h = hashlib.sha1(f"{os.path.abspath(path)}|{b}|{min_dbz}|{edges[0]}|{edges[-1]}|"
+                     f"{len(edges)}".encode()).hexdigest()[:12]
+    cf = DERIVED / f"dbzhist_{os.path.basename(os.path.dirname(path))}_{b}_{h}.npz"
+    if cache:
+        hit = _load_cached(cf, path, verbose=verbose)
+        if hit is not None:
+            return hit
+
+    if verbose:
+        print(f"computing dbz_histogram for {os.path.basename(os.path.dirname(path))} "
+              f"(uncached; decompressing) ...")
+    ens = load_ensemble(path, bbox=bbox)
+    dbz = hx(ens, min_dbz=min_dbz).astype(np.float32)
+    del ens
+
+    counts, _ = np.histogram(dbz, bins=edges)
+    out = {
+        "counts": counts.astype(np.int64),
+        "edges": edges,
+        "n_total": np.int64(dbz.size),
+        "n_below": np.int64((dbz < edges[0]).sum()),
+        "n_above": np.int64((dbz > edges[-1]).sum()),
+        "Ne": np.int32(dbz.shape[-1]),
+        "min_dbz": np.float32(min_dbz),
+    }
+    del dbz
+    assert int(out["counts"].sum()) + int(out["n_below"]) + int(out["n_above"]) \
+        == int(out["n_total"]), "histogram lost points"
+
+    if cache:
+        _save_cached(cf, out, path)
+        if verbose:
+            print(f"  cached -> {cf.name}")
+    return out
+
+
+def hist_rebin(counts, edges, factor):
+    """Coarsen a histogram by an integer factor. Returns (counts, edges)."""
+    factor = int(factor)
+    n = (len(counts) // factor) * factor
+    return (np.asarray(counts)[:n].reshape(-1, factor).sum(axis=1),
+            np.asarray(edges)[:n + 1:factor])
+
+
+def hist_quantile(counts, edges, q, floor=None):
+    """q-quantile of a binned sample, linearly interpolated inside the bin.
+
+    `floor` restricts the sample to values at or above it, which is how the
+    thresholded distributions in N2 are summarised: the quantile is then over echo
+    values only, not over a sample dominated by clamped clear air.
+    """
+    counts, edges = np.asarray(counts, float), np.asarray(edges, float)
+    if floor is not None:
+        counts = np.where(edges[:-1] >= floor, counts, 0.0)
+    tot = counts.sum()
+    if tot == 0:
+        return np.nan
+    cum = np.cumsum(counts)
+    target = np.atleast_1d(q) * tot
+    out = []
+    for t in target:
+        k = int(np.searchsorted(cum, t, side="left"))
+        k = min(k, len(counts) - 1)
+        below = cum[k] - counts[k]
+        frac = (t - below) / counts[k] if counts[k] else 0.0
+        out.append(edges[k] + frac * (edges[k + 1] - edges[k]))
+    return out[0] if np.isscalar(q) else np.array(out)
+
+
+def hist_frac_above(counts, edges, thresh, n_total=None, n_above=0):
+    """Fraction of the whole sample at or above `thresh`."""
+    counts, edges = np.asarray(counts, float), np.asarray(edges, float)
+    tot = float(n_total) if n_total is not None else counts.sum() + float(n_above)
+    return float((counts[edges[:-1] >= thresh].sum() + float(n_above)) / tot)
 
 
 def map_field(ax, lats, lons, field_xy, cmap=None, norm=None, rasterized=True, **kw):
@@ -648,6 +840,46 @@ def combos_in(df):
     """Sorted list of the 6-tuple combos present."""
     g = df[list(COMBO_FIELDS)].drop_duplicates()
     return sorted(tuple(r) for r in g.itertuples(index=False, name=None))
+
+
+def _combo_list(x):
+    return list(x.combos) if isinstance(x, Aligned) else list(x)
+
+
+def combo_key(combos, method, ntemp=None, loc=None):
+    """The 6-tuple for a (method, ntemp[, loc]) pair.
+
+    Replaces the list comprehension every N3/N4 cell used to open-code, which
+    silently took [0] of the matches and so picked an arbitrary combo whenever the
+    selection was ambiguous. Here an ambiguous selection raises.
+    """
+    cands = [k for k in _combo_list(combos)
+             if k[0] == method
+             and (ntemp is None or int(k[1]) == int(ntemp))
+             and (loc is None or np.isclose(float(k[3]), float(loc)))]
+    if not cands:
+        raise KeyError(f"no combo method={method!r} ntemp={ntemp} loc={loc}; "
+                       f"present: {_combo_list(combos)}")
+    if len(cands) > 1:
+        raise KeyError(f"combo method={method!r} ntemp={ntemp} loc={loc} is ambiguous: "
+                       f"{cands}. Pass loc= to disambiguate.")
+    return cands[0]
+
+
+def combo_order(combos):
+    """Presentation order: TEnKF by increasing ntemp first, then the other methods.
+
+    The plain sorted() order of combos_in puts AOEI before TEnKF and so breaks the
+    'no tempering -> more tempering' reading of every axis it labels.
+    """
+    return sorted(_combo_list(combos),
+                  key=lambda k: (0 if k[0] == "TEnKF" else 1, k[0],
+                                 int(k[1]), float(k[3])))
+
+
+def combo_slug(combo):
+    """Filename/column-safe tag for a combo, e.g. 'TEnKF_Nt2', 'AOEI_Nt1'."""
+    return f"{combo[0]}_Nt{int(combo[1])}"
 
 
 class Aligned:
@@ -852,13 +1084,76 @@ def skill_summary(aligned, metric="rmse", var="obs", red="w"):
                            ).reset_index(drop=True)
 
 
+def skill_summary_by_tm(aligned, metric="rmse", var="obs", red="w"):
+    """skill_summary, split by truth member.
+
+    Same skill() call and the same tie tolerance, so the pooled table is this table
+    aggregated over tm -- the two cannot drift apart.
+
+    Why it exists: one truth member is one draw of the OSSE -- a different truth, a
+    different prior (leave-one-out) and a different observation-noise realisation.
+    Wilson intervals treat the ~1e6 spatially correlated points of a single member as
+    independent samples, so they shrink as 1/sqrt(points) and understate how much the
+    answer moves when the experiment is redrawn. The spread of these per-member
+    numbers does not shrink with points and is the honest error bar, exactly as
+    METHODOLOGY_CHECKLIST.md sec.9 requires. A difference between two update schemes
+    smaller than the across-tm spread is not a result.
+
+    Requires the 'tm' column that load_runs adds.
+    """
+    tol = TOL[var]
+    rows = []
+    for c in sorted(aligned.combos):
+        f = aligned.frames[c]
+        if "tm" not in f.columns:
+            raise ColumnError(
+                "frames carry no 'tm' column -- skill_summary_by_tm needs the truth "
+                "member, which load_runs adds from the *_tmNN.npz filename.")
+        s = skill(f, metric=metric, var=var, red=red).to_numpy(float)
+        tm = f["tm"].to_numpy()
+        good = np.isfinite(s)
+        for t in np.unique(tm):
+            in_tm = tm == t
+            sv = s[in_tm & good]
+            n = int(sv.size)
+            rows.append({
+                "run": str(f["run"].iloc[0]) if "run" in f else "",
+                "loc_km": float(f["loc_km"].iloc[0]) if "loc_km" in f else float(c[3]),
+                "method": c[0], "ntemp": int(c[1]), "alpha_s": float(c[2]),
+                "metric": metric, "var": var, "red": red, "tm": int(t),
+                "n_points": n, "n_nan": int((in_tm & ~good).sum()),
+                "median_skill": float(np.median(sv)) if n else np.nan,
+                "mean_skill": float(np.mean(sv)) if n else np.nan,
+                "frac_improved": float((sv > tol).mean()) if n else np.nan,
+                "frac_degraded": float((sv < -tol).mean()) if n else np.nan,
+            })
+    return pd.DataFrame(rows).sort_values(
+        ["metric", "var", "red", "method", "ntemp", "tm"]).reset_index(drop=True)
+
+
 _DIGEST_COLS = ["run", "loc_km", "method", "ntemp", "alpha_s", "metric", "var", "red",
                 "n_points", "n_nan", "median_skill", "mean_skill",
                 "frac_improved", "frac_degraded"]
 
 
-def _canonical(df):
-    d = df[[c for c in _DIGEST_COLS if c in df.columns]].copy()
+def _canonical(df, cols=None):
+    """Project a table onto the columns that define it, rounded and row-sorted.
+
+    `cols=None` keeps the sweep's column set: that is what every N3 table is, and
+    changing it would move digests that are pasted into other notebooks. A table
+    that is NOT a sweep row -- the multi-obs tables of N4 are keyed by dataset,
+    hour and domain, none of which is in _DIGEST_COLS -- passes its own columns
+    instead, so publishing does not silently drop the columns it exists to carry.
+    """
+    keep = list(cols) if cols is not None else _DIGEST_COLS
+    if cols is not None:
+        # An explicit list is a promise about the table; a typo in it must not turn
+        # into a quietly narrower CSV.
+        missing = [c for c in keep if c not in df.columns]
+        if missing:
+            raise ColumnError(f"publish(cols=...) names columns the table does not "
+                              f"have: {missing}")
+    d = df[[c for c in keep if c in df.columns]].copy()
     for c in d.columns:
         if d[c].dtype.kind == "f":
             # round to ~6 significant digits: float32 accumulation order varies with
@@ -867,32 +1162,38 @@ def _canonical(df):
     return d.sort_values(list(d.columns)).reset_index(drop=True)
 
 
-def consistency_digest(df):
-    return hashlib.sha1(_canonical(df).to_csv(index=False).encode()).hexdigest()[:16]
+def consistency_digest(df, cols=None):
+    return hashlib.sha1(_canonical(df, cols).to_csv(index=False).encode()).hexdigest()[:16]
 
 
-def publish(name, df, verbose=True):
-    """Persist a canonical table and return its digest (the string N4 pastes)."""
+def publish(name, df, cols=None, verbose=True):
+    """Persist a canonical table and return its digest (the string N4 pastes).
+
+    `cols` names the columns to keep; see _canonical. Pass list(df.columns) for a
+    table that is not a sweep row.
+    """
     p = DERIVED / f"{name}.csv"
-    _canonical(df).to_csv(p, index=False)
-    dig = consistency_digest(df)
+    out = _canonical(df, cols)
+    out.to_csv(p, index=False)
+    dig = consistency_digest(df, cols)
     if verbose:
-        print(f"published {p.name}  digest={dig}")
+        print(f"published {p.name}  ({len(out):,} rows x {out.shape[1]} cols)  "
+              f"digest={dig}")
     return dig
 
 
-def expect(name, df, digest=None):
+def expect(name, df, digest=None, cols=None):
     """Two independent checks: against the pasted digest, and against the stored CSV.
 
     Raises ConsistencyError carrying a row-aligned .diff.
     """
-    got = consistency_digest(df)
+    got = consistency_digest(df, cols)
     p = DERIVED / f"{name}.csv"
     if not p.exists():
         raise ConsistencyError(f"{p.name} not found -- run the notebook that publishes "
                                f"'{name}' first.")
     ref = pd.read_csv(p)
-    cur = _canonical(df)
+    cur = _canonical(df, cols)
     try:
         pd.testing.assert_frame_equal(ref, cur, check_dtype=False, rtol=1e-6, atol=0)
     except AssertionError as e:
@@ -952,14 +1253,15 @@ assert_convention()
 PREDICTORS = [
     ("n_active_f_point", "members with signal", (0, 100)),
     ("frac_floor", "fraction of members at the floor", (0, 100)),
-    ("spread_f_point_obs", r"prior spread $\sigma_H$ [dBZ]", (0.5, 99.5)),
+    ("spread_f_point_obs", r"prior spread $\sigma_H$", (0.5, 99.5)),
     ("abs_skew_f", r"prior $|$skewness$|$", (0.5, 99)),
+    ("skew_f_point_obs", r"prior skewness", (0.5, 99)),
     ("kurt_f_point_obs", "prior excess kurtosis", (0.5, 99)),
-    ("abs_dep_b", r"$|$innovation$|$ [dBZ]", (0.5, 99.5)),
-    ("norm_innov", r"normalised innovation $|d|/\sqrt{\sigma_H^2+R}$", (0, 99.5)),
+    ("abs_dep_b", r"$|$innovation$|$", (0.5, 99.5)),
+    ("dep_b", r"innovation", (0.5, 99.5)),
+    ("norm_innov", r"normalised innovation", (0, 99.5)),
     ("z_km", "height [km]", (0, 100)),
 ]
-
 
 def add_predictors(df, R, Ne=None, dbz_min=0.0):
     """Prior-condition predictors, all derived from stored sweep columns.
@@ -1016,10 +1318,10 @@ def binned_mean(x, y, c, xr, yr, grid=24, mincnt=5):
     return g.T, xe, ye
 
 
-def prob_hexbin(ax, x, y, mask, xlim, ylim, gridsize=45, mincnt=40, **kw):
+def prob_hexbin(ax, x, y, mask, xlim, ylim, gridsize=45, mincnt=1, **kw):
     """P(mask) per hexagonal bin, on a 0..1 diverging scale."""
     return ax.hexbin(x, y, C=np.asarray(mask, float), reduce_C_function=np.mean,
-                     gridsize=gridsize, cmap=CMAP_DIV, vmin=0.0, vmax=1.0,
+                     gridsize=gridsize, cmap="RdBu_r", vmin=0.0, vmax=1.0,
                      mincnt=mincnt, extent=(xlim[0], xlim[1], ylim[0], ylim[1]),
                      linewidths=0.0, **kw)
 
@@ -1050,8 +1352,8 @@ AOI = dict(lat=(-41.5, -25.3), lon=(-68.6, -55.4))
 
 RASTER_ZORDER = 2.5
 
-
-def setup_map(ax, extent=None, labels=True, rasterize_below=RASTER_ZORDER):
+def setup_map(ax, extent=None, labels=True, xlocs=None, ylocs=None,
+              left_labels=True, bottom_labels=True, rasterize_below=RASTER_ZORDER):
     """Cartopy basemap. Returns False (and leaves ax alone) if cartopy is absent.
 
     Everything below `rasterize_below` is flattened to pixels on export: the data
@@ -1078,13 +1380,22 @@ def setup_map(ax, extent=None, labels=True, rasterize_below=RASTER_ZORDER):
         edgecolor="black", linewidth=0.4, linestyle=":", zorder=2)
     e = extent or (AOI["lon"][0], AOI["lon"][1], AOI["lat"][0], AOI["lat"][1])
     ax.set_extent(e, crs=ccrs.PlateCarree())
-    gl = ax.gridlines(draw_labels=labels, linestyle="--", alpha=0.4, color="gray",
-                      linewidth=0.4)
+    gl = ax.gridlines(draw_labels=labels, linestyle="--", alpha=0.4,
+                      color="gray", linewidth=0.4)
     gl.top_labels = gl.right_labels = False
-    gl.xlabel_style = gl.ylabel_style = {"size": 7}
+    gl.left_labels   = left_labels
+    gl.bottom_labels = bottom_labels
+    if xlocs is not None:
+        gl.xlocator = mticker.FixedLocator(xlocs)
+    if ylocs is not None:
+        gl.ylocator = mticker.FixedLocator(ylocs)
+    gl.xlabel_style = {"size": 6, "rotation": 45, "ha": "right"}
+    gl.ylabel_style = {"size": 6}
     if rasterize_below is not None:
         ax.set_rasterization_zorder(rasterize_below)
     return True
+
+
 
 
 def draw_box(ax, lat_lim, lon_lim, **kw):
