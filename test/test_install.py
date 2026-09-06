@@ -176,6 +176,73 @@ def test_aoei_update_inflates():
     print(f"PASS  aoei_update: inflated R {R_0:.1f} -> {R_t:.1f} on a large departure")
 
 
+def test_clamp_modes_differ_only_where_they_should():
+    """The three `clamp_hydro` settings, on one synthetic case.
+
+    Four properties, and all four have to hold or the flag is not the control the
+    chapter would be leaning on:
+
+      never    leaves negative hydrometeors in the posterior;
+      per_step leaves none;
+      Nt=1     `final` == `per_step` BIT FOR BIT -- with one step there is nothing to
+               defer, so any difference would be a bug in the flag rather than a
+               finding about the filter;
+      the counters count the same pairs whether or not the floor is applied, so
+      `never`'s bookkeeping is a measurement of its own trajectory and not of nothing.
+    """
+    from da.core import tenkf_update, CLAMP_MODES, HYDRO_VARS
+    IHY = [VAR_IDX[q] for q in HYDRO_VARS]
+
+    def run(mode, nt):
+        c = _synthetic_case()
+        return tenkf_update(c["xf"], c["yo"], c["R0"], c["ox"], c["oy"], c["oz"],
+                            c["loc"], VAR_IDX, nt, 2.0, c["pos_km"], dbz_min=0.0,
+                            clamp_mode=mode)
+
+    assert CLAMP_MODES == ("per_step", "final", "never")
+    r = {m: run(m, 1) for m in CLAMP_MODES}
+    neg = {m: int((r[m]["xa"][:, :, :, :, IHY] < 0).sum()) for m in CLAMP_MODES}
+    assert neg["per_step"] == 0, f"per_step left {neg['per_step']} negative hydrometeors"
+    assert neg["final"] == 0, f"final left {neg['final']} negative hydrometeors"
+    assert neg["never"] > 0, (
+        "never left no negative hydrometeors, so this case cannot tell the three "
+        "modes apart and the test proves nothing")
+    assert np.array_equal(r["per_step"]["xa"], r["final"]["xa"]), (
+        "at Nt=1 `final` and `per_step` are the same operation and must agree exactly")
+
+    cp, cn = r["per_step"]["clamp"], r["never"]["clamp"]
+    assert bool(cp["clamp_applied"][0]) and not bool(cn["clamp_applied"][0])
+    assert int(cp["clamp_n_pairs"][0]) == int(cn["clamp_n_pairs"][0]), (
+        f"the counters disagree across modes at step 0 on an identical trajectory: "
+        f"{int(cp['clamp_n_pairs'][0])} vs {int(cn['clamp_n_pairs'][0])}")
+    assert float(cp["clamp_mass_total"][0]) > 0
+
+    # Nt=3: `final` clamps once, so its first two steps are measured but not applied.
+    f3 = run("final", 3)
+    assert list(f3["clamp"]["clamp_applied"]) == [False, False, True], (
+        f"`final` applied the floor at {list(f3['clamp']['clamp_applied'])}, "
+        f"not only at the last step")
+    assert int((f3["xa"][:, :, :, :, IHY] < 0).sum()) == 0
+    print(f"PASS  clamp_hydro: per_step/final/never differ as specified "
+          f"({neg['never']} negative hydrometeor values left by `never`, 0 by the "
+          f"other two; Nt=1 final == per_step bit for bit)")
+
+
+def test_clamp_mode_is_validated():
+    from da.core import clamp_mode_of
+    assert clamp_mode_of({}) == "per_step"
+    assert clamp_mode_of({"assimilation": None}) == "per_step"
+    assert clamp_mode_of({"assimilation": {"clamp_hydro": "never"}}) == "never"
+    for bad in ("perstep", "Final", "", "true"):
+        try:
+            clamp_mode_of({"assimilation": {"clamp_hydro": bad}})
+        except ValueError:
+            continue
+        raise AssertionError(f"clamp_hydro={bad!r} was accepted; a misspelt mode would "
+                             f"silently run production behaviour under another name")
+    print("PASS  clamp_hydro: defaults to per_step, and 4 misspellings are refused")
+
+
 def test_localization_reaches_points():
     """simple_letkf_wloc returns n_updated; zero would mean the localization cutoff
     excluded every grid point and the 'analysis' is just a copy of the prior."""
@@ -194,6 +261,209 @@ def test_localization_reaches_points():
     total = nx * ny * nz
     assert n_updated > 0, "localization updated no grid points at all"
     print(f"PASS  simple_letkf_wloc: updated {int(n_updated)}/{total} grid points")
+
+
+# ── 3b. the LETKF weights, which §6 stores and nothing else can recover ─────
+
+def test_letkf_weights_reproduce_fortran():
+    """da.core.letkf_weights is a NumPy transcription of common_letkf.f90's letkf_core,
+    used to store the weight matrix at a probed point -- simple_letkf_wloc returns xa
+    and a counter, so the weights are otherwise unrecoverable from a run's output.
+
+    The check is end to end: rebuild the analysis at every updated grid point from the
+    weights alone and compare against what the Fortran produced. If the transcription
+    drifts from the Fortran, the stored weights stop describing the run that happened,
+    and nothing downstream would notice."""
+    from da.core import letkf_weights, local_obs_at
+    from cletkf_wloc import common_da as cda
+    c = _synthetic_case()
+    xf, pos_km, hxf = c["xf"], c["pos_km"], c["hxf"]
+    nx, ny, nz, Ne, nvar = xf.shape
+    idx = (c["ox"].astype(np.intp), c["oy"].astype(np.intp), c["oz"].astype(np.intp))
+    ox, oy, oz = (pos_km[idx[0], idx[1], idx[2], d].astype(np.float32) for d in range(3))
+    dep = (c["yo"] - hxf.mean(axis=1)).astype(np.float32)
+
+    xa_f, _ = cda.simple_letkf_wloc(
+        nx=nx, ny=ny, nz=nz, nbv=Ne, nvar=nvar, nobs=1,
+        hxf=np.asfortranarray(hxf), xf=xf, dep=dep, ox=ox, oy=oy, oz=oz,
+        locs=c["loc"], oerr=c["R0"], pos_km=pos_km)
+
+    hdxb_all = (hxf - hxf.mean(axis=1)[:, None]).astype(np.float64)
+    worst, probed = 0.0, 0
+    for i in range(nx):
+        for j in range(ny):
+            for k in range(nz):
+                sel, rloc = local_obs_at(i, j, k, ox, oy, oz, c["R0"], c["loc"], pos_km)
+                if len(sel) == 0:
+                    assert np.array_equal(xa_f[i, j, k], xf[i, j, k]), \
+                        "a cell with no local obs was modified"
+                    continue
+                T, wa = letkf_weights(hdxb_all[sel], rloc, dep[sel].astype(np.float64))
+                xfm = xf[i, j, k].mean(axis=0)
+                xa_py = xfm[None, :] + (T + wa[:, None]).T @ (xf[i, j, k] - xfm)
+                scale = max(float(np.abs(xa_f[i, j, k]).max()), 1e-30)
+                worst = max(worst, float(np.abs(xa_py - xa_f[i, j, k]).max() / scale))
+                probed += 1
+    assert probed > 0, "no cell was updated, so nothing was checked"
+    assert worst < 1e-5, f"weights do not reproduce the Fortran analysis: {worst:.2e}"
+    print(f"PASS  letkf_weights: rebuilt the analysis at {probed} cells from the "
+          f"weights alone (worst relative diff {worst:.1e})")
+
+
+# ── 3c. light mode: the scalars must equal what the fields would have given ─
+
+def _multi_obs_case(seed=1):
+    """A tiny multi_obs-shaped case: prior, analysis, truth, and both H(x) fields."""
+    from da.core import letkf_update
+    from da.metrics import compute_multi_obs_metrics
+    c = _synthetic_case(seed=seed)
+    xf = c["xf"]
+    nx, ny, nz, Ne, nvar = xf.shape
+    rng = np.random.default_rng(seed)
+    truth = (xf.mean(axis=3) + rng.normal(0, 1e-4, (nx, ny, nz, nvar))).astype(np.float32)
+    truth[..., VAR_IDX["T"]] += rng.normal(0, 0.5, (nx, ny, nz))
+    res = letkf_update(xf, c["yo"], c["R0"], c["ox"], c["oy"], c["oz"],
+                       c["loc"], VAR_IDX, c["pos_km"], dbz_min=0.0)
+    xa = np.asfortranarray(res["xa"])
+
+    def hx(ens):
+        from cletkf_wloc import common_da as cda
+        r = cda.calc_ref_ens(ens[..., VAR_IDX["qr"]].astype(np.float64),
+                             ens[..., VAR_IDX["qs"]].astype(np.float64),
+                             ens[..., VAR_IDX["qg"]].astype(np.float64),
+                             ens[..., VAR_IDX["T"]].astype(np.float64),
+                             ens[..., VAR_IDX["P"]].astype(np.float64), min_dbz=0.0)
+        return np.maximum(r, 0.0).astype(np.float32)
+
+    ens_hxf, ens_hxa = hx(xf), hx(xa)
+    truth_hx = hx(truth[:, :, :, None, :])[:, :, :, 0]
+    var_names = [k for k, _ in sorted(VAR_IDX.items(), key=lambda x: x[1])]
+    obs_ijk = (c["ox"].astype(np.intp), c["oy"].astype(np.intp), c["oz"].astype(np.intp))
+    return dict(xa=xa, xf=xf, truth=truth, ens_hxf=ens_hxf, ens_hxa=ens_hxa,
+                truth_hx=truth_hx, var_names=var_names, Ne=Ne, obs_ijk=obs_ijk,
+                hxf_mean=ens_hxf.mean(axis=3), hxa_mean=ens_hxa.mean(axis=3))
+
+
+def _metrics(case, storage_level, storm_thresh):
+    from da.metrics import compute_multi_obs_metrics
+    return compute_multi_obs_metrics(
+        case["xa"], case["xf"], case["truth"],
+        case["hxf_mean"], case["hxa_mean"], case["truth_hx"],
+        case["var_names"], case["Ne"], storage_level=storage_level,
+        ens_hxf=case["ens_hxf"], ens_hxa=case["ens_hxa"], dbz_min=0.0,
+        obs_ijk=case["obs_ijk"], storm_thresh=storm_thresh)
+
+
+def test_light_scalars_match_full_fields():
+    """The check that licenses trusting light mode: a domain scalar computed with the
+    fields dropped must equal the same quantity recomputed from the fields in full
+    mode. If these disagree, every light run in the batch is unverifiable."""
+    from da.metrics import domain_masks
+    case = _multi_obs_case()
+    # a threshold this synthetic echo actually straddles, so `storm` is a real subset
+    thresh = float(np.median(np.nanmax(case["truth_hx"], axis=2)))
+    light = _metrics(case, "light", thresh)
+    full = _metrics(case, "full", thresh)
+
+    assert not [k for k in light if k.endswith("_field")], "light mode kept a field"
+    assert [k for k in full if k.endswith("_field")], "full mode dropped every field"
+
+    masks = domain_masks(case["truth_hx"], obs_ijk=case["obs_ijk"], storm_thresh=thresh)
+    assert 0 < masks["storm"].sum() < masks["global"].sum(), \
+        "the storm domain is empty or the whole grid; the test would prove nothing"
+
+    worst, checked = 0.0, 0
+    for iv, v in enumerate(case["var_names"]):
+        err = full["abs_err_a_field"][..., iv]
+        for dname, m in masks.items():
+            vals = err[m]
+            vals = vals[np.isfinite(vals)]
+            ref = float(np.sqrt((vals.astype(np.float64) ** 2).mean()))
+            got = light[f"rmse_a_{dname}_{v}"]
+            assert light[f"n_rmse_a_{dname}_{v}"] == vals.size, \
+                f"n_rmse_a_{dname}_{v} is not the count that entered"
+            worst = max(worst, abs(got - ref) / max(abs(ref), 1e-30))
+            checked += 1
+    assert worst < 1e-9, f"light and full disagree by {worst:.2e} relative"
+    print(f"PASS  light scalars match the full fields over "
+          f"{len(masks)} domains x {len(case['var_names'])} variables "
+          f"({checked} comparisons, worst {worst:.1e} relative)")
+
+
+def test_domains_disagree_and_counts_are_written():
+    """The three domains must be able to disagree -- that disagreement is what the
+    chapter's argument rests on -- and every scalar must carry the denominator that
+    produced it."""
+    case = _multi_obs_case()
+    thresh = float(np.median(np.nanmax(case["truth_hx"], axis=2)))
+    m = _metrics(case, "light", thresh)
+    assert m["n_cells_global"] > m["n_cells_storm"] > 0
+    assert m["n_cells_obs"] == len(case["obs_ijk"][0])
+    assert m["rmse_f_global_ref"] != m["rmse_f_storm_ref"], \
+        "global and storm reflectivity RMSE are identical; the restriction did nothing"
+    assert 0.0 <= m["frac_analysis_eq_prior_global"] <= 1.0
+    assert m["n_touched"] + m["n_untouched"] == m["n_cells_global"]
+    print(f"PASS  domains: global {m['n_cells_global']} / storm {m['n_cells_storm']} / "
+          f"obs {m['n_cells_obs']} cells, RMSE_ref {m['rmse_f_global_ref']:.2f} vs "
+          f"{m['rmse_f_storm_ref']:.2f} dBZ, {m['frac_touched_no_obs']:.1%} of touched "
+          f"cells carry no obs")
+
+
+def test_nan_cells_are_not_counted_as_touched():
+    """A cell the update never reached, but which the source data left non-finite, must
+    still count as untouched. `xa == xf` gets this wrong -- NaN == NaN is False -- and
+    the error is invisible in light mode, where the ensembles are not on disk to check
+    against. On dataset A at 20 UTC it inflated n_touched by 53 of 7,188, which is
+    exactly the number of cells non-finite in the prior."""
+    from da.metrics import _untouched_mask
+    rng = np.random.default_rng(3)
+    xf = rng.normal(size=(3, 3, 2, 5, 4)).astype(np.float32)
+    xa = xf.copy()
+
+    assert _untouched_mask(xa, xf).all(), "an unmodified copy read as touched"
+
+    # a masked source cell: NaN in the prior, and copied verbatim into the analysis
+    xf[0, 1, 0, 2, 3] = np.nan
+    xa[0, 1, 0, 2, 3] = np.nan
+    m_nan = _untouched_mask(xa, xf)
+    assert m_nan.all(), \
+        f"a NaN cell was counted as touched ({int((~m_nan).sum())} cells)"
+
+    # and a cell that genuinely moved must still read as touched
+    xa[2, 2, 1, 4, 1] += 1.0
+    m = _untouched_mask(xa, xf)
+    assert m[0, 1, 0], "the NaN cell flipped to touched once another cell changed"
+    assert not m[2, 2, 1], "a genuinely changed cell was counted as untouched"
+    assert int((~m).sum()) == 1, f"expected exactly 1 touched cell, got {int((~m).sum())}"
+    print("PASS  untouched mask: a NaN cell stays untouched, a changed cell does not")
+
+
+def test_nan_cells_do_not_poison_the_scalars():
+    """The state fields carry non-finite cells, and in light mode the scalar is the
+    only source. A plain .mean() returns NaN there -- which is what every
+    rmse_*_global_* in the runs already on disk actually is."""
+    case = _multi_obs_case()
+    thresh = float(np.median(np.nanmax(case["truth_hx"], axis=2)))
+    clean = _metrics(case, "light", thresh)
+
+    poisoned = dict(case)
+    truth = case["truth"].copy()
+    truth[0, 0, 0, VAR_IDX["w"]] = np.nan
+    truth[1, 2, 1, VAR_IDX["w"]] = np.nan
+    poisoned["truth"] = truth
+    got = _metrics(poisoned, "light", thresh)
+
+    assert np.isfinite(got["rmse_f_global_w"]), \
+        "a NaN cell poisoned the protected reduction"
+    assert got["n_rmse_f_global_w"] == clean["n_rmse_f_global_w"] - 2, \
+        "the dropped cells are not reflected in the count that entered"
+    assert np.isfinite(got["rmse_f_global_qg"]), "an unrelated variable was affected"
+    naive = float(np.mean((case["xf"].mean(axis=3)[..., VAR_IDX["w"]]
+                           - truth[..., VAR_IDX["w"]]) ** 2))
+    assert not np.isfinite(naive), "the naive reduction was expected to be NaN here"
+    print(f"PASS  protected reductions: rmse_f_global_w = "
+          f"{got['rmse_f_global_w']:.4f} over {got['n_rmse_f_global_w']} of "
+          f"{got['n_cells_global']} cells, where a plain .mean() gives nan")
 
 
 # ── 4. tempering schedule and AOEI algebra ──────────────────────────────────
@@ -245,6 +515,13 @@ TESTS = [
     test_tenkf_update,
     test_aoei_update_inflates,
     test_localization_reaches_points,
+    test_clamp_modes_differ_only_where_they_should,
+    test_clamp_mode_is_validated,
+    test_letkf_weights_reproduce_fortran,
+    test_light_scalars_match_full_fields,
+    test_domains_disagree_and_counts_are_written,
+    test_nan_cells_are_not_counted_as_touched,
+    test_nan_cells_do_not_poison_the_scalars,
     test_schedule_sums_to_one,
     test_schedule_equal_weights_at_zero,
     test_schedule_back_loaded,

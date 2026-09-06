@@ -111,6 +111,134 @@ def crps_ensemble_sorted(ens, truth, axis=3):
     term2 = (weight * sorted_ens).sum(axis=-1) / (Ne ** 2)
     return term1 - term2
 
+# ---------------------------------------------------------------------------
+# Evaluation domains and protected reductions
+# ---------------------------------------------------------------------------
+
+STORM_THRESH_DBZ = 20.0
+
+
+def domain_masks(truth_hx_field, obs_ijk=None, storm_thresh=STORM_THRESH_DBZ):
+    """The three evaluation domains for an (nx, ny, nz) field.
+
+    global  every cell
+    storm   COLUMNS whose truth column-max reflectivity >= storm_thresh, broadcast to
+            all levels. Not "cells with echo": the clear air above and below a storm
+            column is inside this domain, which is the point -- it is where the
+            increment lands without an observation to justify it.
+    obs     the cells carrying an assimilated observation
+
+    The chapter's argument rests on these three disagreeing: single-step and AOEI
+    degrade reflectivity globally and improve it inside storm columns, and the sign
+    disagrees between domains in 24 of 60 experiment-scheme pairs. In light mode the
+    fields are gone, so if the scalars are not restricted here that comparison cannot
+    be made at all.
+
+    Notebooks/nbcommon.py imports this rather than defining its own, so the light-mode
+    scalar and the notebook's field-recomputed value cannot drift apart.
+    """
+    m = {"global": np.ones(truth_hx_field.shape, bool)}
+    m["storm"] = np.broadcast_to(
+        (np.nanmax(truth_hx_field, axis=2) >= storm_thresh)[:, :, None],
+        truth_hx_field.shape)
+    if obs_ijk is not None:
+        o = np.zeros(truth_hx_field.shape, bool)
+        o[obs_ijk[0], obs_ijk[1], obs_ijk[2]] = True
+        m["obs"] = o
+    return m
+
+
+def _finite_reduce(field, mask, kind, Ne=None):
+    """Reduce `field` over `mask`, dropping non-finite cells. Returns (value, n_used).
+
+    Every aggregate goes through here -- RMSE, bias, spread and CRPS included, not
+    only the shape metrics that had protected reducers before. The state fields carry
+    non-finite cells (N2 §12: 41-56 per hour in dataset A, a per-cell source mask
+    propagated by `np.ma.filled(..., np.nan)`), so a plain `.mean()` returns NaN and
+    the scalar is unusable. The notebooks worked around it by recomputing from the
+    fields; in light mode there are no fields to recompute from, so the scalar is the
+    only source and the protection has to be here.
+
+    `n_used` is the denominator that was actually used -- the count that entered, not
+    the domain size. It is written beside every scalar, because a mean over 1,523,027
+    cells and one over 1,522,832 are not the same number and nothing else on disk
+    would say which happened. The dropped count is `n_cells_{domain}` minus this.
+
+    RMSE is sqrt(mean(err**2)) over the surviving cells, never mean(|err|).
+    The squares accumulate in float64: at 1.5 M cells a float32 sum of dBZ**2 loses
+    the last digits of the answer.
+    """
+    v = field[mask]
+    fin = np.isfinite(v)
+    n_used = int(fin.sum())
+    if n_used == 0:
+        return np.nan, 0
+    g = v[fin].astype(np.float64)
+    if kind == "rmse":
+        return float(np.sqrt((g ** 2).mean())), n_used
+    if kind == "mean":
+        return float(g.mean()), n_used
+    if kind == "absmean":
+        return float(np.abs(g).mean()), n_used
+    if kind == "spread":
+        return float(np.sqrt((Ne + 1) / Ne * (g ** 2).mean())), n_used
+    raise ValueError(f"unknown reduction {kind!r}")
+
+
+# metric name -> (which field family, how it reduces)
+_DOMAIN_METRICS = (
+    ("rmse",   "err",    "rmse"),
+    ("bias",   "err",    "mean"),
+    ("spread", "std",    "spread"),
+    ("crps",   "crps",   "mean"),
+    ("skew",   "skew",   "absmean"),
+    ("kurt",   "kurt",   "absmean"),
+)
+
+
+def _emit_domain_scalars(out, domains, var_key, fields, Ne):
+    """Write every metric x domain x {prior, analysis} scalar for one variable.
+
+    `fields` maps (family, 'f'|'a') -> an (nx, ny, nz) field. Missing entries are
+    skipped rather than faked, so a caller without a posterior ensemble still gets the
+    prior half instead of a file full of NaN.
+    """
+    for dname, dmask in domains.items():
+        for metric, family, kind in _DOMAIN_METRICS:
+            for side in ("f", "a"):
+                fld = fields.get((family, side))
+                if fld is None:
+                    continue
+                val, n_used = _finite_reduce(fld, dmask, kind, Ne=Ne)
+                out[f"{metric}_{side}_{dname}_{var_key}"] = val
+                out[f"n_{metric}_{side}_{dname}_{var_key}"] = n_used
+
+
+def _untouched_mask(xa, xf):
+    """Cells where the analysis equals the prior EXACTLY, in every member and variable.
+
+    simple_letkf_wloc copies the prior verbatim at any grid point with no observation
+    inside the localization cutoff, so this is the complement of the set the update
+    reached. The notebooks recompute it from the ensembles; in light mode those are
+    gone, which is why it is reduced to scalars here.
+
+    Accumulated one variable at a time: the whole-array comparison would allocate an
+    (nx, ny, nz, Ne, nvar) boolean -- 2.6 GB at the full domain with Ne=59.
+
+    A plain `xa == xf` is WRONG here, and silently: NaN == NaN is False, so every cell
+    the source data left non-finite would be reported as touched by an update that never
+    reached it. On dataset A at 20 UTC that inflated n_touched by 53 of 7,188 -- the
+    exact number of cells non-finite in the prior. Two NaNs in the same position mean
+    the value did not change, so they count as equal.
+    """
+    acc = np.ones(xa.shape[:3], bool)
+    for iv in range(xa.shape[-1]):
+        a, f = xa[..., iv], xf[..., iv]
+        same = (a == f) | (np.isnan(a) & np.isnan(f))
+        acc &= same.all(axis=3)
+    return acc
+
+
 def _per_var(fn, ens, *extra):
     """Apply a member-axis reduction one state variable at a time, then restack.
 
@@ -304,13 +432,49 @@ def compute_single_obs_metrics(
 
     return out
 
+# Obs-space (reflectivity) fields. `output.store_ref_fields` alone keeps these and drops
+# the per-state-variable ones; the `*_ref_field` keys are matched by suffix, not listed.
+REF_FIELDS = ("hxf_mean_field", "hxa_mean_field", "truth_hx_field",
+              "err_hxf_field", "residual_field", "n_active_f_field")
+
+
+def _apply_storage_level(out, storage_level):
+    """Drop metric FIELDS the storage level does not keep. Scalars always survive.
+
+    The fields are computed either way -- every domain scalar is a reduction of one --
+    so this changes what lands on disk and nothing else. A `full` multi-obs scheme file
+    is ~520 MB; `ref` is ~21 MB; `light` is a few hundred kilobytes.
+
+    The ensemble (`store_ensemble`) is deliberately outside this: it is orthogonal to
+    which metric fields are kept, and it is the one thing here that scales with Ne.
+    """
+    if storage_level == "full":
+        return out
+    if storage_level not in ("ref", "light"):
+        raise ValueError(f"storage_level must be light/ref/full, got {storage_level!r}")
+    keep = {}
+    for k, v in out.items():
+        if not k.endswith("_field"):
+            keep[k] = v                       # scalars, and the store_ensemble arrays
+        elif storage_level == "ref" and (k in REF_FIELDS or "_ref_field" in k):
+            keep[k] = v
+    return keep
+
+
 def compute_multi_obs_metrics(
         xa, xf, truth,
         hxf_mean_field, hxa_mean_field, truth_hx_field,
-        var_names, Ne, store_fields=False,
-        ens_hxf=None, ens_hxa=None, dbz_min=0.0
+        var_names, Ne, store_ensemble=False, storage_level="full",
+        ens_hxf=None, ens_hxa=None, dbz_min=0.0,
+        obs_ijk=None, storm_thresh=STORM_THRESH_DBZ
 ) -> dict:
     """Full-domain metrics for multi_obs mode.
+
+    `storage_level` selects what is KEPT, not what is computed:
+      full   every metric field, state and reflectivity   (the historical behaviour)
+      ref    the reflectivity fields only
+      light  no fields at all -- per-domain scalars only
+    The tag's REF / FULL flag must agree with it; see src/naming.py.
 
     `ens_hxf`/`ens_hxa` are the prior/posterior obs-space (reflectivity) ensembles,
     (nx, ny, nz, Ne). When supplied, reflectivity gets the same metric families as the
@@ -399,45 +563,70 @@ def compute_multi_obs_metrics(
     for _k, _v in ref.items():
         out[_k] = _v.astype(np.float32) if _v.dtype.kind == "f" else _v
 
-    if store_fields:
+    if store_ensemble:
         out["xf"] = xf.astype(np.float32)
         out["xa"] = xa.astype(np.float32)
         out["truth_state"] = truth.astype(np.float32)
 
+    # ---- domain-restricted scalars -----------------------------------------
+    # These are the whole point of light mode: the fields above never reach disk, so
+    # every number the chapter quotes has to survive as a scalar here. Each is a
+    # reduction of a field that was computed anyway, so this costs passes over memory
+    # and nothing else.
+    domains = domain_masks(truth_hx_field, obs_ijk=obs_ijk, storm_thresh=storm_thresh)
+    for dname, dmask in domains.items():
+        out[f"n_cells_{dname}"] = int(np.count_nonzero(dmask))
+    out["storm_thresh_dbz"] = float(storm_thresh)
+
     for iv, vname in enumerate(var_names):
         err_f = xf_mean[..., iv] - truth[..., iv]
         err_a = xa_mean[..., iv] - truth[..., iv]
-        out[f"rmse_f_global_{vname}"] = float(np.sqrt((err_f ** 2).mean()))
-        out[f"rmse_a_global_{vname}"] = float(np.sqrt((err_a ** 2).mean()))
-        out[f"bias_f_global_{vname}"] = float(err_f.mean())
-        out[f"bias_a_global_{vname}"] = float(err_a.mean())
+        _emit_domain_scalars(out, domains, vname, {
+            ("err",  "f"): err_f,          ("err",  "a"): err_a,
+            ("std",  "f"): xf_std[..., iv], ("std",  "a"): xa_std[..., iv],
+            ("crps", "f"): crps_f_field[..., iv], ("crps", "a"): crps_a_field[..., iv],
+            ("skew", "f"): skew_f_field[..., iv], ("skew", "a"): skew_a_field[..., iv],
+            ("kurt", "f"): kurt_f_field[..., iv], ("kurt", "a"): kurt_a_field[..., iv],
+        }, Ne)
 
-        out[f"spread_f_global_{vname}"] = float(np.sqrt((Ne+1)/Ne * (xf_std[..., iv]**2).mean()))
-        out[f"spread_a_global_{vname}"] = float(np.sqrt((Ne+1)/Ne * (xa_std[..., iv]**2).mean()))
-
-        out[f"skew_f_global_{vname}"] = _nanmean_quiet(np.abs(skew_f_field[..., iv]))
-        out[f"skew_a_global_{vname}"] = _nanmean_quiet(np.abs(skew_a_field[..., iv]))
-        out[f"kurt_f_global_{vname}"] = _nanmean_quiet(np.abs(kurt_f_field[..., iv]))
-        out[f"kurt_a_global_{vname}"] = _nanmean_quiet(np.abs(kurt_a_field[..., iv]))
-        out[f"crps_f_global_{vname}"] = _nanmean_quiet(crps_f_field[..., iv])
-        out[f"crps_a_global_{vname}"] = _nanmean_quiet(crps_a_field[..., iv])
-
-    # Reflectivity globals, same reducers as the state loop above so `_global_ref` can be
-    # read alongside `_global_{vname}` for vname in var_names.
-    out["rmse_f_global_ref"] = float(np.sqrt((err_hxf_field ** 2).mean()))
-    out["rmse_a_global_ref"] = float(np.sqrt((residual_field ** 2).mean()))
-    out["bias_f_global_ref"] = float(err_hxf_field.mean())
-    out["bias_a_global_ref"] = float(residual_field.mean())
+    # Reflectivity, same reducers and the same key shape, so `_global_ref` reads
+    # alongside `_global_{vname}` for vname in var_names.
+    ref_fields = {("err", "f"): err_hxf_field, ("err", "a"): residual_field}
+    if ref:
+        ref_fields.update({
+            ("std",  "f"): ref["spread_f_ref_field"], ("std",  "a"): ref["spread_a_ref_field"],
+            ("crps", "f"): ref["crps_f_ref_field"],   ("crps", "a"): ref["crps_a_ref_field"],
+            ("skew", "f"): ref["skew_f_ref_field"],   ("skew", "a"): ref["skew_a_ref_field"],
+            ("kurt", "f"): ref["kurt_f_ref_field"],   ("kurt", "a"): ref["kurt_a_ref_field"],
+        })
+    _emit_domain_scalars(out, domains, "ref", ref_fields, Ne)
 
     if ref:
-        out["spread_f_global_ref"] = float(np.sqrt((Ne+1)/Ne * (ref["spread_f_ref_field"]**2).mean()))
-        out["spread_a_global_ref"] = float(np.sqrt((Ne+1)/Ne * (ref["spread_a_ref_field"]**2).mean()))
-        out["skew_f_global_ref"]   = _nanmean_quiet(np.abs(ref["skew_f_ref_field"]))
-        out["skew_a_global_ref"]   = _nanmean_quiet(np.abs(ref["skew_a_ref_field"]))
-        out["kurt_f_global_ref"]   = _nanmean_quiet(np.abs(ref["kurt_f_ref_field"]))
-        out["kurt_a_global_ref"]   = _nanmean_quiet(np.abs(ref["kurt_a_ref_field"]))
-        out["crps_f_global_ref"]   = _nanmean_quiet(ref["crps_f_ref_field"])
-        out["crps_a_global_ref"]   = _nanmean_quiet(ref["crps_a_ref_field"])
-        out["n_active_f_global"]   = float(ref["n_active_f_field"].mean())
+        # n_active_f_global keeps its historical name and value; the two new domains
+        # join it under the same pattern.
+        for dname, dmask in domains.items():
+            out[f"n_active_f_{dname}"] = float(
+                ref["n_active_f_field"][dmask].mean()) if np.any(dmask) else np.nan
 
-    return out
+    # ---- what the update actually reached -----------------------------------
+    # Two counts the notebooks recompute from the ensembles today, and cannot in light
+    # mode. `frac_analysis_eq_prior` says how much of the domain the update never
+    # touched at all; `frac_touched_no_obs` is the reach of the localization -- the
+    # share of updated cells that carry no observation of their own, which is exactly
+    # what separates §4.7 from the sweep, where every cell updated is the obs cell.
+    untouched = _untouched_mask(xa, xf)
+    touched = ~untouched
+    n_touched = int(np.count_nonzero(touched))
+    out["n_touched"] = n_touched
+    out["n_untouched"] = int(np.count_nonzero(untouched))
+    for dname, dmask in domains.items():
+        n_d = int(np.count_nonzero(dmask))
+        out[f"frac_analysis_eq_prior_{dname}"] = (
+            float(np.count_nonzero(untouched & dmask) / n_d) if n_d else np.nan)
+    if obs_ijk is not None:
+        has_obs = domains["obs"]
+        out["frac_touched_no_obs"] = (
+            float(np.count_nonzero(touched & ~has_obs) / n_touched) if n_touched else np.nan)
+        out["n_obs_cells"] = int(np.count_nonzero(has_obs))
+
+    return _apply_storage_level(out, storage_level)

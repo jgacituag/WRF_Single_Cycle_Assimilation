@@ -27,6 +27,13 @@ state_ensemble : (nx, ny, nz, Ne, 8)  float32
 lats       : (ny, nx)      latitude  [deg]
 lons       : (ny, nx)      longitude [deg]
 z_heights  : (nz, ny, nx)  height above sea level [m]
+valid_mask : (nx, ny, nz)  bool
+    False where at least one member carried a non-finite value in at least one
+    variable. Those cells are NaN in EVERY member and variable in state_ensemble, so
+    the ensemble size is uniform across the domain -- see VALID_MASK_NOTE, stored
+    alongside as `valid_mask_note`.
+members_read : (Ne,) bool   which member files were found (a missing one is all-NaN
+    and is excluded from the union mask)
 pos_km     : (nx, ny, nz, 3)  real-space position from the lower-left corner [km]
     pos_km[i, j, k, 0] = x  east  distance from corner (i=0, j=0) [km]
     pos_km[i, j, k, 1] = y  north distance from corner (i=0, j=0) [km]
@@ -38,9 +45,25 @@ pos_km     : (nx, ny, nz, 3)  real-space position from the lower-left corner [km
 YAML config schema
 ------------------
 cross_sections_job:
+  # ---- dataset identity, written into every subset ----
+  # dataset_id is REQUIRED and is checked against the output path. It is never parsed
+  # back out of the filename, so a mistyped path fails instead of silently relabelling
+  # the data. The output path must end in
+  #     3D_subsets_{A|B|C|D}/subset_{same letter}_{YYYYMMDDHHMMSS}.npz
+  dataset_id:   D          # A | B | C | D
+  physics:      single     # multi | single
+  da_cycle_min: 5          # upstream DA cycle length [minutes]
+  upstream:     GUES       # which POST tree the prior came from
+  # source_run is NOT a key: it is read from the pattern above (the directory above
+  # POST), so it can never disagree with the files actually read. Override only if the
+  # pattern does not follow that layout.
+  # config_index: [...]    # 60 entries, the physics configuration each member used.
+  #   Omit when it is not recorded: the subset then carries an all -1 array plus a note
+  #   saying so. Never invent it -- -1 must always mean "not recorded".
+  # dx_km is NOT configured; it is measured from pos_km at extraction time.
   paths:
     pattern:    "/path/{member}/wrfout_d01_{date}"   # {member} and {date} are substituted
-    output:     "/path/to/output/subset_{date}.npz"
+    output:     "/path/to/data/3D_subsets_D/subset_D_{date}.npz"
     init_date:  "2023-12-16_19:00:00"
     end_date:   "2023-12-16_19:00:00"
     freq:       "1H"
@@ -60,6 +83,7 @@ cross_sections_job:
 
 import argparse
 import os
+import sys
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -67,6 +91,112 @@ import pandas as pd
 import yaml
 from netCDF4 import Dataset
 from tqdm import tqdm
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from naming import TagError, validate_subset_path
+
+
+# The note stored beside `valid_mask`, so nobody has to rediscover why a handful of
+# cells are NaN in every member.
+VALID_MASK_NOTE = (
+    "False where AT LEAST ONE member carried a non-finite value in AT LEAST ONE "
+    "variable. Those cells are set to NaN in every member and every variable, so the "
+    "ensemble size is uniform across the domain. Diagnosed in N2 12: in dataset A the "
+    "bad cells are 41-56 per hour, identical across all eight variables, never a whole "
+    "column and never at a domain edge; 32 of 60 members carry 1-4 cells each, and "
+    "those cells are masked in that member's own source netCDF, which "
+    "np.ma.filled(..., np.nan) in _get_vars_post propagates one cell at a time. A cell "
+    "valid in 28 members and not in the other 32 gives that column a different "
+    "ensemble size than its neighbours, which biases every shape statistic and every "
+    "covariance computed there. The union costs ~50 cells out of 1.5 M and removes the "
+    "problem instead of leaving it to be managed downstream."
+)
+
+
+# The note stored beside an all -1 config_index, so a reader is never left guessing
+# whether -1 is a configuration number.
+CONFIG_INDEX_UNKNOWN = (
+    "not recorded: no member-to-physics mapping was available at extraction time. "
+    "-1 means 'not recorded', never 'configuration -1'."
+)
+
+
+def _source_run(cfg_job: dict) -> str:
+    """The upstream WRF experiment a subset was built from.
+
+    Taken from the input pattern -- the directory above POST -- rather than asked for
+    again as a config key, so it cannot disagree with the files actually read. This is
+    the one piece of provenance the chapter's "how each dataset was built" paragraph
+    needs and that nothing on disk carried before.
+    """
+    explicit = cfg_job.get("source_run")
+    if explicit:
+        return str(explicit)
+    pattern = (cfg_job.get("paths") or {}).get("pattern", "")
+    parts = [q for q in pattern.split("/") if q]
+    if "POST" in parts:
+        i = parts.index("POST")
+        if i > 0:
+            return parts[i - 1]
+    return "unknown"
+
+
+def _union_mask(out: np.ndarray, members_read: np.ndarray) -> Tuple[np.ndarray, int]:
+    """The union of every member's non-finite cells, and how many there are.
+
+    Accumulated one member and one variable at a time: `np.isfinite(out).all(...)` on
+    the whole array would allocate a boolean the size of the ensemble -- 2.7 GB on
+    dataset C -- for a result that is (nx, ny, nz).
+
+    Members whose file was missing entirely are excluded. They are all-NaN by
+    construction, so including one would mask the whole domain.
+    """
+    valid = np.ones(out.shape[:3], bool)
+    for j in np.flatnonzero(members_read):
+        for v in range(out.shape[4]):
+            valid &= np.isfinite(out[:, :, :, j, v])
+    return valid, int((~valid).sum())
+
+
+def _identity(cfg_job: dict, dataset_id: str, n_members: int, pos_km: np.ndarray) -> dict:
+    """The identity block written into every subset.
+
+    dataset_id comes from an explicit config key and is checked against the output
+    path -- it is never parsed back out of the filename, so a mistyped path fails
+    instead of silently relabelling the data.
+
+    dx_km is MEASURED from pos_km rather than configured: it is a property of the grid
+    that was just read, and a configured value could disagree with it.
+    """
+    ci = cfg_job.get("config_index")
+    if ci is None:
+        config_index = np.full(n_members, -1, np.int16)
+        note = CONFIG_INDEX_UNKNOWN
+    else:
+        config_index = np.asarray(ci, np.int16)
+        if config_index.shape != (n_members,):
+            raise ValueError(
+                f"cross_sections_job.config_index has {config_index.shape[0]} entries "
+                f"but the ensemble has {n_members} members")
+        note = "recorded at extraction time from cross_sections_job.config_index"
+
+    physics = cfg_job.get("physics")
+    if physics not in ("multi", "single"):
+        raise ValueError(f"cross_sections_job.physics must be 'multi' or 'single', "
+                         f"got {physics!r}")
+    if cfg_job.get("da_cycle_min") is None:
+        raise ValueError("cross_sections_job.da_cycle_min is required [minutes]")
+
+    return dict(
+        dataset_id=np.array(dataset_id),
+        da_cycle_min=np.int16(cfg_job["da_cycle_min"]),
+        dx_km=np.float32(np.median(np.diff(pos_km[:, 0, 0, 0]))),
+        physics=np.array(physics),
+        upstream=np.array(cfg_job.get("upstream", "unknown")),
+        source_run=np.array(_source_run(cfg_job)),
+        config_index=config_index,
+        config_index_note=np.array(note),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -380,11 +510,22 @@ def process_data(config_path: str) -> None:
     )
     print(f"[info] format={fmt}  {len(dates)} date(s)  ({date_ini} -> {date_end})")
  
+    # Validate every output path BEFORE reading a single member: extracting 60 members
+    # takes long enough that discovering a malformed path at write time is a wasted job.
+    job = cfg["cross_sections_job"]
+    dataset_id = job.get("dataset_id")
+    for dt in dates:
+        _, _, probe_out = _resolve_paths(cfg, dt)
+        try:
+            validate_subset_path(probe_out, dataset_id)
+        except TagError as e:
+            raise SystemExit(f"[{os.path.basename(config_path)}] {e}")
+
     for dt in dates:
         date_str = dt.strftime(cfg["cross_sections_job"]["paths"].get(
                                "date_fmt", "%Y-%m-%d_%H:%M:%S"))
         print(f"\n--- {date_str} ---")
- 
+
         members, nc_paths, out_path = _resolve_paths(cfg, dt)
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
  
@@ -409,10 +550,12 @@ def process_data(config_path: str) -> None:
               f"z=[{pos_km[:,:,:,2].min():.2f}, {pos_km[:,:,:,2].max():.2f}] km")
  
         ##### fill ensemble array ##########################################################
+        members_read = np.ones(Ne, bool)
         for j, path in enumerate(tqdm(nc_paths, desc="members")):
             if not os.path.isfile(path):
                 print(f"[warning] missing: {path}")
                 out[:, :, :, j, :] = np.nan
+                members_read[j] = False
                 continue
             if fmt == "wrfout":
                 _fill_member_wrfout(path, sub_cfg, out, j)
@@ -428,6 +571,24 @@ def process_data(config_path: str) -> None:
             out   = out[:, :, finite_z, :, :]
             z_sub = z_sub[finite_z, :, :]
  
+        ##### mask the union of the members' bad cells ##############################
+        # Fixed here rather than managed downstream. A cell valid in 28 members and not
+        # in the other 32 gives that column a different ensemble size than its
+        # neighbours; masking the union makes the ensemble size uniform, and the mask is
+        # written into the subset so downstream code can assert on it instead of
+        # rediscovering it. Applied to A, B, C and D alike.
+        valid_mask, n_masked = _union_mask(out, members_read)
+        if n_masked:
+            out[~valid_mask] = np.nan
+            frac = 100.0 * n_masked / valid_mask.size
+            print(f"[clean] masked {n_masked} cell(s) ({frac:.4f} % of "
+                  f"{valid_mask.size}) in every member: non-finite in at least one "
+                  f"member's source file.")
+        if not members_read.all():
+            print(f"[clean] {int((~members_read).sum())} member(s) were missing and are "
+                  f"all-NaN; they are excluded from the union mask.")
+
+        ident = _identity(job, dataset_id, out.shape[3], pos_km)
         np.savez_compressed(
             out_path,
             state_ensemble=out,
@@ -435,8 +596,17 @@ def process_data(config_path: str) -> None:
             lons=lons_sub,
             z_heights=z_sub,
             pos_km=pos_km,
+            valid_mask=valid_mask,
+            n_masked_cells=np.int64(n_masked),
+            valid_mask_note=np.array(VALID_MASK_NOTE),
+            members_read=members_read,
+            **ident,
         )
         print(f"[done] {out_path}  shape={out.shape}")
+        print(f"[id]   dataset_id={dataset_id}  da_cycle_min={int(ident['da_cycle_min'])}"
+              f"  dx_km={float(ident['dx_km']):.4f}  physics={str(ident['physics'])}"
+              f"  upstream={str(ident['upstream'])}  source_run={str(ident['source_run'])}"
+              f"  config_index={'recorded' if (ident['config_index'] >= 0).any() else 'all -1 (not recorded)'}")
  
     print("\n[info] all dates processed.")
  

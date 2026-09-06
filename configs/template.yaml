@@ -27,7 +27,21 @@
 # Metadata
 # ---------------------------------------------------------------------------
 
-experiment_tag: MY_EXPERIMENT   # Used in output filenames and the config copy.
+# The run's name. VALIDATED AT STARTUP against src/naming.py, before anything is
+# loaded -- a six-hour run should not discover at write time that its name is wrong.
+#
+#   WS_{A|B|C|D}_{sweep|multiobs|point}_{HHMM}_LOC{L}[_FLAGS]
+#
+# Flags in this order: QC WIN STEPS REF FULL ALLMEM AS<x>. No field flag = light mode.
+# Every field is cross-checked against this config rather than trusted:
+#   LOC      == sweep.loc_x, and loc_y/loc_z (the tag claims an isotropic scale)
+#   mode     == sweep.obs_points.mode   (single_obs is spelled `point` in a tag)
+#   QC<code> present exactly when qc.dep_band is set, and the code matches the band
+#            ([2, 8] -> QC2t8, [-1, 3] -> QCm1t3)
+#   STEPS    present exactly when any output.steps_* switch is on
+#   REF/FULL match the output block's field switches
+# A tag that disagrees with its own config is worse than an ugly one: it is believed.
+experiment_tag: WS_D_sweep_1900_LOC0.1_ALLMEM
 
 # Verbosity — controls what timing and progress is printed.
 #   0  silent (errors only)
@@ -112,8 +126,71 @@ qc:
   # Rationale: low variance → ensemble carries no information → update is noise.
   filter_variance: true
 
+  # Departure-band REJECTION [dBZ]. This is 4.8.
+  #
+  #   d = yo - mean(H(xf))            SIGNED, not |d|
+  #   reject the observation when     dep_min <= d <= dep_max
+  #
+  # Rejection, not retention: a point satisfying the condition is DROPPED. The damaging
+  # band sits just above zero, so a rule on |d| would also reject departures near
+  # -5 dBZ, which are not damaging -- hence the signed form.
+  #
+  # `d` is the same dep_b da/metrics.py stores under that name, and N3-1D 0a confirmed
+  # that dep_b is post-clamp in the sweep. It is evaluated here in the same place:
+  # AFTER clamp_obs and filter_variance, BEFORE the assimilation call. Evaluating it
+  # anywhere else would apply a different rule than the one the chapter derived.
+  #
+  # Evaluated ONCE on the original prior; the surviving observation set is then held
+  # fixed across every tempering step. See dep_band_per_step below.
+  #
+  # Absent by default: every run made before this existed is unaffected. When set, the
+  # tag MUST carry the matching QC code (naming.qc_code: [2, 8] -> QC2t8), and when it
+  # is absent the tag must NOT -- validate_experiment_tag enforces both directions, so
+  # a run with a band and one without cannot collide on disk.
+  #
+  # NOTE the rename. `departure_band` meant RETENTION -- keep the points inside the
+  # band. `dep_band` is REJECTION on the same numbers, i.e. the opposite observation
+  # set, so the old key is refused with an error rather than silently aliased.
+  # dep_band: [2, 8]
+
+  # Re-evaluate the band at every tempering step instead of once on the prior.
+  # NOT IMPLEMENTED, and deliberately so: it is a different method, closer to an
+  # iterative robust filter, and an observation rejected at step 2 has already
+  # influenced step 1. The key exists so that the choice this run made is visible in
+  # the config rather than being a hidden assumption in the code.
+  dep_band_per_step: false
+
 # ---------------------------------------------------------------------------
 # Sweep
+# ---------------------------------------------------------------------------
+# ASSIMILATION
+# ---------------------------------------------------------------------------
+
+assimilation:
+
+  # What to do with negative hydrometeors after a LETKF update. `qr`, `qs` and `qg`
+  # are floored at zero -- a nonlinear projection applied after a linear update, so
+  # the analysis is no longer the state the covariances that produced it describe.
+  #
+  #   per_step   after every tempering step. THE PRODUCTION DEFAULT, and it stays it.
+  #   final      once, after the last step. The intermediate states the next update
+  #              relinearises around keep their negative hydrometeors, so the
+  #              projection cannot enter the next step's covariance. This is the
+  #              setting that separates "the clamp is a side effect" from "the clamp
+  #              is part of the differential": with Nt=1 it is identical to per_step
+  #              by construction, and any difference at Nt>=2 is the accumulation.
+  #   never      not at all. Unphysical as a product -- the posterior carries negative
+  #              mass -- but it is the clean control for how much the clamp does at
+  #              all, and in clear air, where the truth has no hydrometeors and a
+  #              clamp toward zero is a push toward the truth, it is the only way to
+  #              tell the assimilation's skill from the projection's.
+  #
+  # Every run records what the floor touched per step regardless of the setting:
+  # clamp_n_pairs (cell,member pairs below zero), clamp_mass_total and the per-species
+  # split, plus clamp_applied. Under `never` those counts are a counterfactual on the
+  # unclamped trajectory, not the production run's.
+  clamp_hydro: per_step
+
 # ---------------------------------------------------------------------------
 #
 # Sweep parameters support three formats:
@@ -168,11 +245,29 @@ sweep:
   #             reference file per truth member (truth, xf_mean, yo).
 
   obs_points:
-    mode: sweep          # single_obs | sweep | multi_obs
+    mode: sweep          # single_obs | sweep | multi_obs   (`point` == single_obs)
 
-    # --- single_obs only ---
+    # --- single_obs / point only ---
     # Grid indices of the fixed observation point (0-based).
     loc: {x: 84, y: 108, z: 5}
+
+    # `points` promotes single_obs to point mode: the same assimilation, run at each
+    # listed cell, storing at every tempering step the full ensemble in state space
+    # (before AND after the hydrometeor clamp) and in observation space, plus the LETKF
+    # weight matrix. Sixty members x nine fields x sixteen steps x three points is
+    # kilobytes, so everything is stored and there is nothing to choose.
+    #
+    # The weights matter because the increment is X_f w: they are what say whether one
+    # member dominates the update, and whether tempering concentrates weight as the
+    # iterations grow -- collapse by weight degeneracy rather than by the transform,
+    # which xa alone cannot distinguish.
+    #
+    # The clamp pair tests a live hypothesis. If the posterior clamps qg, qr and qs at
+    # zero, that is a nonlinear operation applied after a linear update, breaking
+    # consistency between the state and its covariances, and it would accumulate over
+    # iterations. It fits the pattern that hydrometeors improve while everything else
+    # degrades. If the two arrays coincide, the hypothesis dies in one figure.
+    # points: [[84, 108, 5], [90, 112, 3]]
 
   # -------------------------------------------------------------------------
   # DA methods
@@ -208,14 +303,68 @@ sweep:
   # loc_z: {start: 2.0, stop: 6.0, num: 3}
 
 # ---------------------------------------------------------------------------
-# Single-obs options (only used when obs_points.mode: single_obs)
+# Output: what reaches disk
 # ---------------------------------------------------------------------------
+#
+# This is what makes the batch affordable. The metric fields -- abs_err, bias, spread,
+# skew, kurt, crps over the eight state variables -- are the bulk: ~0.7 GB per multi_obs
+# file on A and B, ~2.4 GB on C. Five schemes x five truth members x twelve
+# (dataset, hour) combinations is ~380 GB, and 4.8 doubles it. The domain scalars are
+# a few kB and carry every number the chapter quotes.
+#
+# Four independent switches, because their costs differ by orders of magnitude. None of
+# them changes what is COMPUTED -- every scalar is a reduction of a field, so the fields
+# are built either way; they change what lands on disk.
 
-# If true, save xf_sub, truth_sub, and xa_sub for each combo alongside
-# the metrics. Useful for plotting spatial analysis increments.
-# Warning: xa_sub is (nx_s, ny_s, nz_s, Ne, nvar) — can be large if the
-# subdomain is large relative to the localization scale.
-store_fields: false
+output:
+  store_scalars:      true    # always; domain aggregates only, a few kB
+  store_ref_fields:   false   # 13 (nx,ny,nz) reflectivity fields, ~80 MB on A
+  store_state_fields: false   # 12 (nx,ny,nz,8) state fields, ~590 MB on A
+  store_ensemble:     false   # xf / xa / truth_state -- what store_fields used to mean
+
+  # ---- intermediate tempering steps ----------------------------------------
+  # Three more levels, again because the costs differ by four orders of magnitude.
+
+  # The departure VECTOR per step, float32, ~13 MB/step on C. A vector, never a
+  # histogram: fixed bin edges are irreversible and re-binning would mean re-running
+  # the experiment, which is the one thing storing intermediate steps is meant to
+  # avoid. Also stores the pre-filter departure over every candidate point plus one
+  # mask per filter, so the effect of a different band stays reconstructable.
+  # Alongside each step: alpha_i and the effective R/alpha_i, so a figure can be
+  # annotated without recomputing the schedule.
+  steps_departure: false
+
+  # [[i, j, k], ...] -- the full ensemble at these cells, at every step.
+  steps_cells: []
+
+  # Full metric fields per step. Expensive; rarely wanted.
+  steps_fields: false
+
+# Any steps_* switch requires STEPS in the tag, and REF / FULL must match the field
+# switches: none -> no flag, ref only -> REF, state -> FULL.
+#
+# DEPRECATED spellings, still accepted so old configs reproduce, and refused if mixed
+# with `output:` because they describe the same bytes:
+#
+#   store_fields: true      == store_ref_fields + store_state_fields + store_ensemble
+#   storage_level: full     == store_ref_fields + store_state_fields
+#   storage_level: ref      == store_ref_fields
+#   storage_level: light    == neither
+#
+# With none of them present the defaults are what the code has always done: multi_obs
+# wrote every metric field, sweep and single_obs wrote scalar rows.
+
+# ---------------------------------------------------------------------------
+# The per-truth-member reference file
+# ---------------------------------------------------------------------------
+#
+# NOT a storage level and not optional -- it is written at every level, in multi_obs and
+# point mode alike. It carries truth_hx_field and xf_mean, which is where the domain
+# masks come from and where the Jensen gap |h(mean(x_f)) - mean(h(x_f))| is computed;
+# both halves of that gap are stored side by side as hxf_mean_field and
+# hx_of_xfmean_field. Without it 4.7.6 loses its central predictor and the domain
+# restriction becomes impossible. The runner asserts it exists before writing anything
+# else.
 
 # ---------------------------------------------------------------------------
 # Subdomain cutoff factor

@@ -4,9 +4,18 @@
 cross_sections_job:
   format: wrfout    # use wrf-python to read wrfout files
 
+  # ---- dataset identity, written into every subset ----
+  # Required. Checked against the output path, which must end in
+  #   3D_subsets_{A|B|C|D}/subset_{same letter}_{YYYYMMDDHHMMSS}.npz
+  dataset_id:   D          # A | B | C | D
+  physics:      single     # multi | single
+  da_cycle_min: 5          # upstream DA cycle length [minutes]
+  upstream:     GUES
+  # config_index: [...]    # per-member physics config; omit if not recorded.
+
   paths:
     pattern:   "/path/{member}/wrfout_d01_{date}"
-    output:    "/path/output/subset_{date}.npz"
+    output:    "/path/to/data/3D_subsets_D/subset_D_{date}.npz"
     init_date: "2023-12-16_19:00:00"
     end_date:  "2023-12-16_19:00:00"
     freq:      "1H"

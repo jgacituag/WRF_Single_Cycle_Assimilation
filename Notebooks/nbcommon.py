@@ -41,59 +41,10 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.colors import BoundaryNorm, LinearSegmentedColormap, TwoSlopeNorm
 import matplotlib.ticker as mticker
-__version__ = "1.0"
+__version__ = "2.0"
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §0  Convention, banner, schema guard
-# ═════════════════════════════════════════════════════════════════════════════
-
-CONVENTION = """\
-SIGN CONVENTION -- one rule, enforced by this module.
-
-  Every quantity named `skill` is  prior - analysis.
-  POSITIVE MEANS THE ANALYSIS IS BETTER THAN THE PRIOR.
-
-  There is no other difference in this module. nbcommon exports no `drmse`, no
-  `delta`, no `d_*`. skill() is the only function that subtracts a prior from an
-  analysis, and it always subtracts in that order.
-
-  `spread` is NOT a skill metric -- lower spread is not better -- and
-  skill(metric='spread') raises.
-
-  `bias`, `skew` and `kurt` are compared as magnitudes: skill = |prior| - |analysis|.
-  (skew/kurt at the _w_/_u_ reductions are already stored as means of |.|, so the
-  magnitude is not taken twice; see da/metrics.py.)
-
-  Colour: CMAP_SKILL is RdBu_r -- RED at positive (better), blue at negative
-  (worse), always centred on 0. Red-is-better is not the reading a meteorology
-  audience brings by default, so every caption that uses it says so. It is used
-  with skill() output and nothing else.
-
-  Column names are NATIVE and the variable suffix is LAST:
-      crps_f_w_w   = loc-weighted CRPS of vertical wind
-      rmse_f_u_u   = unweighted   RMSE of zonal wind
-  Never build a column name by string surgery -- call colname()."""
-
-# Sweep npz column count after the reflectivity-metrics change (315 -> 362).
-# load_sweep() warns when a file predates it.
-SCHEMA_NCOLS = 362
-
-
-def banner(check_fortran=True):
-    """Print the convention and the environment into the notebook's own output."""
-    print(CONVENTION)
-    print("-" * 78)
-    print(f"nbcommon {__version__}   repo: {REPO}")
-    print(f"figures -> {FIG_DIR}")
-    print(f"derived -> {DERIVED}")
-    if check_fortran:
-        ok = verify_hx(n=500, quiet=True)
-        print(f"reflectivity operator vs Fortran: {'OK' if ok else 'NOT CHECKED (see warning)'}")
-    print("-" * 78)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# §1  Paths and run configuration
+# 1  Paths and run configuration
 # ═════════════════════════════════════════════════════════════════════════════
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -110,15 +61,576 @@ if str(REPO / "src" / "fortran") not in sys.path:
     sys.path.insert(0, str(REPO / "src" / "fortran"))
 
 
-def subset_path(hour, family="", date="20240319", stem="GUES_SINGLECONF"):
-    """Path to a 3D subset npz. `hour` is '18'..'21'; `family` is '' or '_1HR'.
+DATASETS = ("A", "B", "C", "D")
 
-    The hour is always a parameter -- no notebook hardcodes a valid time.
+# What each dataset letter is, for captions and for the assertion messages below.
+# The chapter's old "A" was the single-physics run and is now D; the new A is a
+# multi-physics rebuild. Anything that still assumes SINGLECONF == A is wrong.
+DS_DESC = {
+    "A": "4 km, 5 min DA, multi-physics (rebuild)",
+    "B": "4 km, 1 h DA, multi-physics",
+    "C": "2 km, 5 min DA, multi-physics",
+    "D": "4 km, 5 min DA, single-physics",
+}
+
+
+def subset_path(hour, dataset, date="20240319"):
+    """Path to a 3D subset npz: data/3D_subsets_{DS}/subset_{DS}_{stamp}.npz.
+
+    `hour` is '18'..'21'; `dataset` is one of A/B/C/D. The hour is always a parameter
+    -- no notebook hardcodes a valid time -- and so is the dataset, which used to be
+    smuggled in as a directory stem plus a filename suffix.
     """
+    if dataset not in DATASETS:
+        raise ValueError(f"dataset must be one of {DATASETS}, got {dataset!r}")
     stamp = f"{date}{hour}0000"
-    d = DATA / f"3D_subsets_{date}_{stem}_{stamp}{family}"
-    p = d / f"subset_{stamp}.npz"
-    return str(p)
+    return str(DATA / f"3D_subsets_{dataset}" / f"subset_{dataset}_{stamp}.npz")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 1b  The analysis window, and the N2 diagnostic caches
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ONE analysis window, used by every notebook and every section. A 5.5 deg square
+# centred at 36.0 S. It lives here rather than in a notebook cell so that "inside the
+# window" cannot mean two different boxes in two different figures.
+WIN_LAT = (-38.75, -33.25)
+WIN_LON = (-62.00, -56.50)
+
+# The four datasets. A, B and C carry the chapter; D appears only in the
+# physics-diversity contrast against A -- a fourth row for a secondary question would
+# widen every panel in the main figures.
+DS_MAIN = ("A", "B", "C")
+DS_ALL = ("A", "B", "C", "D")
+
+DS_ROLE = {
+    "A": "main",
+    "B": "isolates the DA cycle against A",
+    "C": "isolates resolution against A",
+    "D": "isolates physics diversity against A (secondary)",
+}
+
+N2_HOURS = ("18", "19", "20", "21")
+
+
+def _n2_cache(kind, ds, hour):
+    return DERIVED / f"n2_{kind}_{ds}_20240319{hour}0000.npz"
+
+
+def n2_available(kind, ds, hours=N2_HOURS):
+    return [h for h in hours if _n2_cache(kind, ds, h).exists()]
+
+
+def identity_block(ds, hour="19"):
+    """The identity a dataset's own file reports. Read, never assumed.
+
+    This is also the material for the 4.2 paragraph on how each dataset was built:
+    the upstream run, its DA cycle, its grid spacing and whether its physics were
+    varied across members.
+    """
+    p = subset_path(hour, ds)
+    with np.load(p, allow_pickle=False) as f:
+        out = {}
+        for k in ("dataset_id", "physics", "da_cycle_min", "dx_km", "upstream",
+                  "source_run"):
+            if k in f.files:
+                v = f[k]
+                out[k] = str(v) if v.dtype.kind in "US" else v.item()
+            else:
+                # "" rather than None: publish() sorts the table, and a None mixed with
+                # strings in an object column raises on comparison in pandas.
+                out[k] = ""
+        ci = f["config_index"] if "config_index" in f.files else None
+    out["config_index"] = ("not recorded" if ci is None or (ci < 0).all()
+                           else f"{len(set(ci.tolist()))} configurations")
+    out["file"] = os.path.basename(p)
+    return out
+
+
+def n2_departures(ds, hours=N2_HOURS):
+    """4 · per-member departure statistics, the four hours CONCATENATED.
+
+    Sums and counts are added across hours and divided at the end, which is what
+    concatenating the four observation sets means. Averaging four per-hour means would
+    instead weight an hour with few observations like an hour with many.
+
+    Returns one row per candidate truth member with, for each of the echo and no-echo
+    branches, the mean departure over the positive branch, the mean over the negative
+    branch, and the fraction of observations of each sign. A single mean would conflate
+    how strong the departures of one sign are with how many there are.
+
+    NOT the same statistic as n2_loo_members(). This one is restricted to the OBSERVATION
+    NETWORK -- at least one of the OTHER 59 members carrying echo, the set `filter_variance`
+    builds -- and to reflectivity. n2_loo_members() covers every point where the 60
+    members are not identical, which additionally includes the points where only the truth
+    member carries echo, and it covers qtot and w as well. The numbers therefore differ,
+    and both are kept: this one is the network the runs actually assimilate.
+    """
+    got = n2_available("depart", ds, hours)
+    if not got:
+        raise FileNotFoundError(f"no n2_depart cache for {ds}; run "
+                                f"src/build_n2_diagnostics.py --ds {ds}")
+    acc = None
+    for h in got:
+        with np.load(_n2_cache("depart", ds, h)) as f:
+            d = {k: f[k] for k in f.files if not k.startswith("_")}
+        acc = d if acc is None else {k: (acc[k] + d[k] if k != "ne_tot" else acc[k])
+                                     for k in acc}
+    rows = []
+    ne_tot = int(acc["ne_tot"])
+    for m in range(ne_tot):
+        r = {"member": m, "hours": len(got)}
+        for tag in ("echo", "clear"):
+            n = acc[f"{tag}_n"][m]
+            npos, nneg = acc[f"{tag}_npos"][m], acc[f"{tag}_nneg"][m]
+            r[f"{tag}_n"] = int(n)
+            # Both fractions, not one: they sum to 1 only where no departure is exactly
+            # zero, and the residual is worth being able to see rather than assume away.
+            r[f"{tag}_pos_frac"] = npos / n if n else np.nan
+            r[f"{tag}_neg_frac"] = nneg / n if n else np.nan
+            r[f"{tag}_zero_frac"] = (n - npos - nneg) / n if n else np.nan
+            r[f"{tag}_pos_mean"] = acc[f"{tag}_spos"][m] / npos if npos else np.nan
+            r[f"{tag}_neg_mean"] = acc[f"{tag}_sneg"][m] / nneg if nneg else np.nan
+        rows.append(r)
+    df = pd.DataFrame(rows)
+    # the magnitude axis of the 4 figure: how strong a departure is, regardless of
+    # sign, over the echo branch -- the branch the censoring does not bound.
+    df["echo_mean_mag"] = (df["echo_pos_frac"] * df["echo_pos_mean"].abs()
+                           + (1 - df["echo_pos_frac"]) * df["echo_neg_mean"].abs())
+    df["dataset"] = ds
+    return df
+
+
+def n2_pairs(ds, hours=N2_HOURS, offset=30):
+    """5 · the offset-k pairing, on FULL fields and on ANOMALIES, with the sign.
+
+    The two readings are opposite, so the answer is meaningless without saying which
+    was computed:
+
+      positive on anomalies -> true twins. 60 members are ~30 independent draws, any
+                               n = 60 in a sign test is wrong, and the sampling noise
+                               in the cross-covariances is a factor sqrt(2) larger
+                               than the nominal size suggests.
+      negative on anomalies -> antithetic pairs, a deliberate variance-reduction
+                               technique. The ensemble spans the same subspace with
+                               better-behaved moments and the effective size is NOT 30.
+
+    The null for the anomaly correlation is not 0 but -1/(Ne-1): anomalies about the
+    ensemble mean sum to zero, so the average off-diagonal correlation is forced
+    slightly negative. It is reported alongside, or the baseline looks like a result.
+    """
+    got = n2_available("pairs", ds, hours)
+    if not got:
+        raise FileNotFoundError(f"no n2_pairs cache for {ds}")
+    rows = []
+    for h in got:
+        with np.load(_n2_cache("pairs", ds, h)) as f:
+            for tag in ("full", "anom"):
+                C = f[f"corr_{tag}"]
+                n = C.shape[0]
+                pair = np.array([C[m, m + offset] for m in range(n - offset)])
+                other = ~np.eye(n, dtype=bool)
+                for m in range(n - offset):
+                    other[m, m + offset] = other[m + offset, m] = False
+                rows.append(dict(dataset=ds, hour=h, basis=tag, Ne=n,
+                                 pair_mean=float(pair.mean()),
+                                 pair_min=float(pair.min()),
+                                 pair_max=float(pair.max()),
+                                 other_mean=float(np.nanmean(C[other])),
+                                 null=-1.0 / (n - 1) if tag == "anom" else np.nan,
+                                 n_partner_is_closest=int(sum(
+                                     1 for m in range(n)
+                                     if int(np.argmax(np.where(np.eye(n, dtype=bool)[m],
+                                                               -np.inf, C[m])))
+                                     == (m + offset) % n))))
+    return pd.DataFrame(rows)
+
+
+def n2_pair_index(ds, hours=N2_HOURS, offset=30):
+    """(pair_id, partner) per member, for stratifying a subsample over the 30 pairs.
+
+    Quantiles taken over the 60 members would count each pair twice and over-weight
+    whichever extreme a pair sits at; take them over the pairs instead.
+    """
+    ne = int(n2_pairs(ds, hours, offset)["Ne"].iloc[0])
+    pair_id = np.array([m % offset for m in range(ne)])
+    partner = np.array([(m + offset) % ne for m in range(ne)])
+    return pair_id, partner
+
+
+def n2_effective_members(ds, hours=N2_HOURS, offset=30, n_members=60):
+    """How many INDEPENDENT truth members a dataset really has, from n2_pairs().
+
+    Returns (n_eff, verdict, evidence). The verdict is read off the sign of the
+    anomaly correlation of the offset-k pairs, because the two signs mean opposite
+    things and only one of them costs the sign test half its n:
+
+      "twins"      pair_mean > other_mean on ANOMALIES -> member m and m+offset are
+                   near-copies. n_eff = offset: a test that uses all `n_members`
+                   differences is counting each draw twice.
+      "antithetic" pair_mean < the null -> a deliberate variance-reduction pairing.
+                   The ensemble still spans the space with `n_members` distinct
+                   draws, so n_eff = n_members.
+      "none"       the pairs are indistinguishable from any other pair.
+                   n_eff = n_members.
+
+    Exists so that no notebook writes `n = 60` or `n = 30` as a literal: the number
+    follows the pairing that N2 measured, and if a rebuilt ensemble ever breaks the
+    pairing the sign tests downstream widen on their own.
+    """
+    t = n2_pairs(ds, hours, offset)
+    a = t[t.basis == "anom"]
+    if a.empty:
+        raise ValueError(f"n2_pairs({ds!r}) returned no anomaly rows")
+    pair, other = float(a["pair_mean"].mean()), float(a["other_mean"].mean())
+    null = float(a["null"].mean())
+    ne = int(a["Ne"].iloc[0])
+    if ne != n_members:
+        raise ValueError(
+            f"dataset {ds}: n2_pairs reports {ne} members, the caller assumed "
+            f"{n_members}. One of the two is looking at the wrong ensemble.")
+    # The margin is against the OTHER-pair mean, not against zero: anomalies about the
+    # ensemble mean are forced slightly negative (the null), so zero is not the
+    # baseline and a test against it would call every ensemble antithetic.
+    if pair > other + 0.05:
+        verdict, n_eff = "twins", int(offset)
+    elif pair < null - 0.05:
+        verdict, n_eff = "antithetic", int(n_members)
+    else:
+        verdict, n_eff = "none", int(n_members)
+    evidence = dict(dataset=ds, basis="anom", offset=int(offset), n_members=ne,
+                    pair_mean=pair, other_mean=other, null=null,
+                    partner_is_closest=f"{a['n_partner_is_closest'].mean():.2f}/{ne}",
+                    verdict=verdict, n_eff=n_eff)
+    return n_eff, verdict, evidence
+
+
+def n2_nonfinite(ds, hours=N2_HOURS):
+    """6 · where the non-finite cells are, per hour."""
+    rows = []
+    for h in n2_available("nonfinite", ds, hours):
+        with np.load(_n2_cache("nonfinite", ds, h)) as f:
+            r = dict(dataset=ds, hour=h)
+            r["cells_any_var"] = int(f["n_cells_any_var"])
+            r["cells_all_vars"] = int(f["n_cells_all_vars"])
+            r["columns"] = int(f["n_columns"])
+            r["full_columns"] = int(f["n_full_columns"])
+            r["at_domain_edge"] = int(f["n_edge"])
+            r["by_level"] = f["by_level"].tolist()
+            r["per_var"] = {v: int(f[f"n_cells_{v}"]) for v in VARS}
+            rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def n2_state(ds, hour="19"):
+    """2/3 · composite-variable moments and window histograms for one hour."""
+    cf = _n2_cache("state", ds, hour)
+    if not cf.exists():
+        raise FileNotFoundError(f"no n2_state cache for {ds} {hour}Z")
+    with np.load(cf) as f:
+        return {k: f[k] for k in f.files if not k.startswith("_")}
+
+
+# ── §8 · leave-one-out departures ────────────────────────────────────────────
+N2_LOO_QUANTITIES = ("qtot", "w", "dbz")
+N2_LOO_BRANCHES = ("echo", "clear", "all")
+N2_LOO_SCOPES = ("dom", "win")
+N2_LOO_LABEL = {"qtot": r"$q_g+q_r+q_s$", "w": "$w$", "dbz": "$Z$"}
+N2_LOO_UNIT = {"qtot": "kg/kg", "w": "m/s", "dbz": "dBZ"}
+
+# Only these keys are summed across the four hours: counts and sums concatenate, a mean
+# or a skewness does not. The moments are merged separately, by _moment_merge.
+_LOO_SUMMED = ("n_", "npos_", "nneg_", "spos_", "sneg_", "hist_", "below_", "above_",
+               "ntot_", "lhpos_", "lhneg_", "lbelow_", "labove_", "lzero_")
+
+
+def _n2_loo_check(ds, hour, d, ref=None):
+    """Refuse to add two departure caches that are not the same statistic.
+
+    Four hours are pooled by adding counts on a SHARED bin grid; if a rebuilt cache ever
+    lands on a different grid, a different window or a different ensemble size, the sum
+    is silently wrong rather than loudly absent. So it is checked instead of assumed.
+    """
+    if int(d["schema"]) != 1:
+        raise ValueError(f"n2_loodep {ds} {hour}Z is schema {int(d['schema'])}; this "
+                         f"reader knows schema 1")
+    if str(d["dataset"]) != ds:
+        raise ValueError(f"n2_loodep for {ds} {hour}Z says it is dataset "
+                         f"{str(d['dataset'])} -- the file and the request disagree")
+    if int(d["ne_tot"]) != 60:
+        raise ValueError(
+            f"n2_loodep {ds} {hour}Z has ne_tot={int(d['ne_tot'])}. The statistic is "
+            f"'each of the 60 against the other 59'; a 59 here means the block ran "
+            f"AFTER the truth-member hold-out and is measuring something else.")
+    if ref is not None:
+        for q in N2_LOO_QUANTITIES:
+            if not np.array_equal(d[f"edges_{q}"], ref[f"edges_{q}"]):
+                raise ValueError(f"{ds} {hour}Z bins {q} on a different grid; the hours "
+                                 f"cannot be added")
+        for k in ("win_i0", "win_i1", "win_j0", "win_j1"):
+            if int(d[k]) != int(ref[k]):
+                raise ValueError(f"{ds} {hour}Z has a different analysis window ({k})")
+    p = subset_path(hour, ds)
+    if os.path.isfile(p) and "_src_size" in d:
+        st = os.stat(p)
+        if int(d["_src_size"]) != st.st_size:
+            warnings.warn(f"n2_loodep {ds} {hour}Z was built from a different "
+                          f"{os.path.basename(p)}; rebuild with --force")
+
+
+def _n2_loo_load(ds, hours):
+    """The four hourly caches, checked against each other, with counts already summed."""
+    got = n2_available("loodep", ds, hours)
+    if not got:
+        raise FileNotFoundError(f"no n2_loodep cache for {ds}; run "
+                                f"src/build_n2_diagnostics.py --ds {ds}")
+    acc, per_hour, ref = None, [], None
+    for h in got:
+        with np.load(_n2_cache("loodep", ds, h)) as f:
+            d = {k: f[k] for k in f.files}
+        _n2_loo_check(ds, h, d, ref)
+        ref = ref or d
+        per_hour.append((h, d))
+        if acc is None:
+            acc = dict(d)
+        else:
+            for k in acc:
+                if k.startswith(_LOO_SUMMED):
+                    acc[k] = acc[k] + d[k]
+    return got, acc, per_hour
+
+
+def _moment_merge(a, b):
+    """Chan-Golub-LeVeque combination of two centred moment sets (n, mean, M2, M3, M4).
+
+    The exact way to pool a skewness or an excess kurtosis across the four hours. Four
+    per-hour skewnesses cannot be averaged: a skewness is a ratio of moments, and the
+    mean of four ratios is the ratio of the pooled moments only when the four samples
+    are the same size and the same distribution -- which four hours of a growing storm
+    are precisely not.
+    """
+    if b["n"] == 0:
+        return a
+    if a["n"] == 0:
+        return b
+    na, nb_ = float(a["n"]), float(b["n"])
+    n = na + nb_
+    d = b["mean"] - a["mean"]
+    d2 = d * d
+    M2 = a["M2"] + b["M2"] + d2 * na * nb_ / n
+    M3 = (a["M3"] + b["M3"] + d2 * d * na * nb_ * (na - nb_) / n ** 2
+          + 3.0 * d * (na * b["M2"] - nb_ * a["M2"]) / n)
+    M4 = (a["M4"] + b["M4"]
+          + d2 * d2 * na * nb_ * (na * na - na * nb_ + nb_ * nb_) / n ** 3
+          + 6.0 * d2 * (na * na * b["M2"] + nb_ * nb_ * a["M2"]) / n ** 2
+          + 4.0 * d * (na * b["M3"] - nb_ * a["M3"]) / n)
+    return dict(n=n, mean=a["mean"] + d * nb_ / n, M2=M2, M3=M3, M4=M4)
+
+
+def n2_loo_members(ds, hours=N2_HOURS, scope="dom", quantities=N2_LOO_QUANTITIES,
+                   branches=N2_LOO_BRANCHES):
+    """8 · per-member leave-one-out departure statistics, the four hours CONCATENATED.
+
+    One row per (candidate truth member, quantity, branch). Counts and sums are ADDED
+    across the hours and divided once at the end, which is what concatenating four
+    observation sets means; averaging four per-hour means would weight an hour with a
+    handful of convective points like an hour full of them.
+
+    The departure is d_m = x_m - mean(x_{k != m}) over all 60 members, taken before the
+    truth member is held out, at every point where the 60 members are not all identical.
+    Where they ARE identical every d_m is exactly zero and the point says nothing about
+    any member, so it is dropped and counted (`n_dead`) rather than averaged in. For
+    reflectivity that removes 42 % of the domain -- clear air sitting at the clamp; for
+    qtot and w it removes almost nothing, because a WRF field is never bit-identical
+    across 60 members.
+
+    `branch` is set by the TRUTH member's reflectivity, for all three quantities alike:
+    'echo' is h(x_m) > min_dbz, 'clear' its complement. For dbz the two are asymmetric BY
+    CONSTRUCTION -- a clear truth gives d = -(60/59) * mean(prior) <= 0, so the positive
+    branch is empty -- and pooling them buries a censoring artefact inside what looks
+    like a property of the member.
+
+    `scope` is 'dom' (the whole subset) or 'win' (the analysis window the rest of N2
+    uses). Both live in the same file: this is a switch, not a rebuild.
+
+    Columns: dataset, member, quantity, branch, scope, hours, n, n_pos, n_neg, n_zero,
+    pos_frac, neg_frac, zero_frac, pos_mean, neg_mean, mean, mean_abs. `pos_mean` and
+    `neg_mean` are the two rows of the §8 figure. `mean_abs = (spos - sneg) / n` is the
+    mean of |d|, exact even when some departures are exactly zero -- unlike a
+    pos_frac*|pos_mean| + (1 - pos_frac)*|neg_mean| reconstruction, which quietly assumes
+    none are.
+    """
+    got, acc, _ = _n2_loo_load(ds, hours)
+    ne = int(acc["ne_tot"])
+    rows = []
+    for q in quantities:
+        for b in branches:
+            k = f"{q}_{b}_{scope}"
+            n, npos, nneg = acc[f"n_{k}"], acc[f"npos_{k}"], acc[f"nneg_{k}"]
+            spos, sneg = acc[f"spos_{k}"], acc[f"sneg_{k}"]
+            for m in range(ne):
+                nm, npm, nnm = int(n[m]), int(npos[m]), int(nneg[m])
+                rows.append(dict(
+                    dataset=ds, member=m, quantity=q, branch=b, scope=scope,
+                    hours=len(got), n=nm, n_pos=npm, n_neg=nnm,
+                    n_zero=nm - npm - nnm,
+                    pos_frac=npm / nm if nm else np.nan,
+                    neg_frac=nnm / nm if nm else np.nan,
+                    zero_frac=(nm - npm - nnm) / nm if nm else np.nan,
+                    pos_mean=spos[m] / npm if npm else np.nan,
+                    neg_mean=sneg[m] / nnm if nnm else np.nan,
+                    mean=(spos[m] + sneg[m]) / nm if nm else np.nan,
+                    mean_abs=(spos[m] - sneg[m]) / nm if nm else np.nan))
+    return pd.DataFrame(rows)
+
+
+def n2_loo_hist(ds, quantity, hours=N2_HOURS, branch="all", scope="dom"):
+    """8 · the pooled departure distribution, the four hours CONCATENATED.
+
+    Counts add across the hours because they are counts on the SAME fixed edges -- the
+    grid is a module constant of the builder, identical in every dataset and every hour,
+    which is what lets four files be summed without a second pass over 50 GB.
+
+    Returns the linear histogram with its two out-of-range tails (so the counts always
+    add up), the dropped zero-spread and non-finite point counts, and the shape numbers
+    -- mean, sd, skewness, excess kurtosis -- pooled EXACTLY through the centred power
+    sums rather than by averaging four per-hour skewnesses. The skewness and kurtosis
+    normalisations are Nerger (2022) Eqs. 25-26, the same ones ensemble_skew and
+    ensemble_kurt use, so a pooled number is comparable with a per-point field.
+
+    Percentiles come back two ways, because they are the one statistic that does not
+    pool: `pct_by_hour` is exact, one row per hour; `pct` is the four-hour value read off
+    the summed histogram with hist_quantile, accurate to `pct_tol`, the bin width.
+
+    `lhist_pos` / `lhist_neg` bin log10|d| by sign. For qtot the linear grid cannot carry
+    the distribution at all -- its quartiles sit at -9e-6, -3e-7 and -5e-10 kg/kg while
+    the top 0.1 % reaches +3e-3, seven decades apart, so three quartiles land in the one
+    bin at the origin. `quantum` is the float32 resolution of the subtraction on this
+    branch: a percentile below it would be reporting the storage grid of the subset file
+    rather than the ensemble.
+    """
+    got, acc, per_hour = _n2_loo_load(ds, hours)
+    k = f"{quantity}_{branch}_{scope}"
+    edges = acc[f"edges_{quantity}"]
+    mom = {"n": 0.0, "mean": 0.0, "M2": 0.0, "M3": 0.0, "M4": 0.0}
+    for _, d in per_hour:
+        mom = _moment_merge(mom, {"n": float(d[f"ntot_{k}"]), "mean": float(d[f"mean_{k}"]),
+                                  "M2": float(d[f"M2_{k}"]), "M3": float(d[f"M3_{k}"]),
+                                  "M4": float(d[f"M4_{k}"])})
+    n = mom["n"]
+    var = mom["M2"] / (n - 1) if n > 1 else np.nan
+    counts = acc[f"hist_{k}"]
+    out = dict(
+        dataset=ds, quantity=quantity, branch=branch, scope=scope, hours=len(got),
+        counts=counts, edges=edges,
+        below=int(acc[f"below_{k}"]), above=int(acc[f"above_{k}"]),
+        n=int(acc[f"ntot_{k}"]),
+        n_live=int(acc[f"nlive_{quantity}_{scope}"]),
+        n_dead=int(acc[f"ndead_{quantity}_{scope}"]),
+        n_bad=int(acc[f"nbad_{quantity}_{scope}"]),
+        n_points=int(acc[f"npts_{scope}"]),
+        mean=mom["mean"], std=np.sqrt(var), M2=mom["M2"], M3=mom["M3"], M4=mom["M4"],
+        skew=(mom["M3"] / n) / var ** 1.5 if n > 1 else np.nan,
+        exkurt=(mom["M4"] / n) / (mom["M2"] / n) ** 2 - 3.0 if n > 1 else np.nan,
+        quantum=float(acc[f"quantum_{k}"]),
+        pct_q=acc["pct_q"],
+        pct=np.array([hist_quantile(counts, edges, float(p) / 100.0) for p in acc["pct_q"]]),
+        pct_tol=float(np.diff(edges)[0]),
+        pct_by_hour=pd.DataFrame([dict(hour=h, **{f"q{p:g}": v for p, v in
+                                                  zip(d["pct_q"], d[f"pct_{k}"])})
+                                  for h, d in per_hour]),
+        lhist_pos=acc[f"lhpos_{quantity}_{branch}_{scope}"] if branch == "all" else None,
+        lhist_neg=acc[f"lhneg_{quantity}_{branch}_{scope}"] if branch == "all" else None,
+        lmag_edges=acc["lmag_edges"],
+        l_zero=int(acc[f"lzero_{k}"]) if branch == "all" else None,
+    )
+    assert out["counts"].sum() + out["below"] + out["above"] == out["n"], \
+        f"{ds} {k}: histogram lost points"
+    return out
+
+
+def n2_loo_shape(ds_list, quantities=N2_LOO_QUANTITIES, hours=N2_HOURS,
+                 branches=("all",), scope="dom"):
+    """The table beside the §7 distribution figure: the numbers a histogram cannot carry.
+
+    Thin loop over n2_loo_hist. The standardised excess kurtosis of the same variable is
+    carried alongside where n2_state has it, because the raw pooled departure mixes
+    points of different ensemble spread -- a mixture of Gaussians of different widths is
+    leptokurtic even when every point is perfectly Gaussian, so the raw number alone
+    cannot separate the mixture from the shape.
+    """
+    rows = []
+    for ds in np.atleast_1d(ds_list):
+        st = n2_state(ds, hours[1]) if quantities else None
+        for q in quantities:
+            for b in branches:
+                h = n2_loo_hist(ds, q, hours=hours, branch=b, scope=scope)
+                rows.append(dict(
+                    dataset=ds, quantity=q, branch=b, n=h["n"], n_dead=h["n_dead"],
+                    mean=h["mean"], sd=h["std"], skew=h["skew"], exkurt=h["exkurt"],
+                    exkurt_std=(float(st[f"pkurt_{q}"]) if st is not None
+                                and f"pkurt_{q}" in st else np.nan),
+                    quantum=h["quantum"], pct_tol=h["pct_tol"],
+                    q01=h["pct"][0], q50=h["pct"][4], q999=h["pct"][-1]))
+    return pd.DataFrame(rows)
+
+
+def win_box(ax, lat=None, lon=None, **kw):
+    """Outline the analysis window on a map axis.
+
+    Every figure that reports something "inside the window" draws the same box from the
+    same two constants, so a reader can see that the box in one panel is the box in the
+    next.
+    """
+    import matplotlib.patches as mpatches
+    import cartopy.crs as ccrs
+    lat = WIN_LAT if lat is None else lat
+    lon = WIN_LON if lon is None else lon
+    style = dict(edgecolor="k", facecolor="none", lw=0.8, ls="--", zorder=5)
+    style.update(kw)
+    ax.add_patch(mpatches.Rectangle(
+        (min(lon), min(lat)), abs(lon[1] - lon[0]), abs(lat[1] - lat[0]),
+        transform=ccrs.PlateCarree(), **style))
+    return ax
+
+
+def dataset_of(path):
+    """The `dataset_id` stored INSIDE a subset or run npz, or None if it has none.
+
+    Read from the file, never parsed from its name. Cheap: np.load reads one small
+    member of the zip, not the gigabytes next to it.
+    """
+    try:
+        with np.load(path, allow_pickle=False) as f:
+            if "dataset_id" not in f.files:
+                return None
+            return str(f["dataset_id"])
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
+def assert_dataset(path, expected, what="file"):
+    """Fail loudly when a file is not the dataset the notebook believed it was.
+
+    The whole point of writing `dataset_id` into the data: a mis-migrated or
+    mis-copied file is then caught at load, instead of being analysed as the wrong
+    dataset and quietly changing a published number. Files written before the
+    identity backfill carry no `dataset_id` and are passed through with a warning
+    rather than an error -- there is nothing to check them against.
+    """
+    got = dataset_of(path)
+    if got is None:
+        warnings.warn(
+            f"{os.path.basename(path)} carries no dataset_id; it predates the identity "
+            f"backfill (src/backfill_identity.py). Believing the caller: {expected}.")
+        return expected
+    if expected is not None and got != expected:
+        raise ValueError(
+            f"dataset mismatch: {path}\n"
+            f"  the notebook expected dataset {expected} ({DS_DESC.get(expected, '?')})\n"
+            f"  the file says              {got} ({DS_DESC.get(got, '?')})\n"
+            f"  Refusing to analyse it as {expected}.")
+    return got
 
 
 def run_dir(tag):
@@ -158,7 +670,7 @@ def dbz_min_of(tag):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §2  Figure style and output
+# 2  Figure style and output
 # ═════════════════════════════════════════════════════════════════════════════
 
 MM = 1 / 25.4
@@ -212,7 +724,7 @@ def panel_label(ax, letter, loc="upper left", pad=0.02):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §3  Palettes, labels, variable tables
+# 3  Palettes, labels, variable tables
 # ═════════════════════════════════════════════════════════════════════════════
 
 # The one dBZ scale. Of the four colormaps in use across the old notebooks this is
@@ -304,7 +816,7 @@ def combo_style(method, ntemp):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §4  Physics
+# 4  Physics
 # ═════════════════════════════════════════════════════════════════════════════
 
 PI = 3.14159265358979
@@ -380,9 +892,14 @@ def verify_hx(n=3000, tol=1e-4, quiet=False):
 # Diagnostics come from the production module -- never redefined here.
 from da.metrics import ensemble_skew, ensemble_kurt, crps_ensemble_sorted  # noqa: E402
 
+# The three evaluation domains, likewise. The runner reduces the light-mode scalars over
+# exactly these masks, so a local copy here would let a notebook's field-recomputed
+# number and the scalar on disk drift apart without either being obviously wrong.
+from da.metrics import STORM_THRESH_DBZ, domain_masks  # noqa: E402
+
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §5  Prior-ensemble access  (N1, N2)
+# 5  Prior-ensemble access  (N1, N2)
 # ═════════════════════════════════════════════════════════════════════════════
 
 SUBSET_KEYS = ("state_ensemble", "lats", "lons", "z_heights", "pos_km")
@@ -434,7 +951,14 @@ def check_subset(path, need=("state_ensemble", "lats", "lons", "pos_km")):
     return "PASS", "x".join(str(s) for s in keys["state_ensemble"][0])
 
 
-def load_subset(path, keys=("lats", "lons", "pos_km", "z_heights")):
+def load_subset(path, keys=("lats", "lons", "pos_km", "z_heights"), dataset=None):
+    """Geometry from a subset npz. Pass `dataset` to assert what the file says it is."""
+    if dataset is not None:
+        assert_dataset(path, dataset)
+    return _load_subset_arrays(path, keys)
+
+
+def _load_subset_arrays(path, keys=("lats", "lons", "pos_km", "z_heights")):
     """Load geometry only. Never touches state_ensemble unless it is listed."""
     try:
         zf = zipfile.ZipFile(path)
@@ -520,21 +1044,47 @@ def _save_cached(cf, out, path):
     np.savez_compressed(cf, **out, **_src_stamp(path))
 
 
-def _cache_key(path, bbox, min_dbz):
+def _cache_stem(path):
+    """The part of a cache filename that names its source.
+
+    The subset FILE stem, not its parent directory. Under the old layout the parent
+    directory carried the hour (`3D_subsets_20240319_GUES_SINGLECONF_20240319180000`);
+    under the dataset-first layout it is just `3D_subsets_D`, so keying on it would
+    leave four hours of caches distinguishable only by their hashes.
+    """
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def _cache_key(path, bbox, min_dbz, truth_member=None):
     b = "full" if bbox is None else f"{bbox[0].start}_{bbox[0].stop}_{bbox[1].start}_{bbox[1].stop}"
-    h = hashlib.sha1(f"{os.path.abspath(path)}|{b}|{min_dbz}".encode()).hexdigest()[:12]
-    return DERIVED / f"prior_{os.path.basename(os.path.dirname(path))}_{b}_{h}.npz"
+    # truth_member is part of the key: a 59-member prior and a 60-member ensemble are
+    # different statistics and must never be served from each other's cache. The
+    # tm=None form keeps the old key exactly, so every cache written before this
+    # parameter existed still hits.
+    tm = "" if truth_member is None else f"|tm{int(truth_member)}"
+    h = hashlib.sha1(f"{os.path.abspath(path)}|{b}|{min_dbz}{tm}".encode()).hexdigest()[:12]
+    suffix = "" if truth_member is None else f"_tm{int(truth_member):02d}"
+    return DERIVED / f"prior_{_cache_stem(path)}_{b}{suffix}_{h}.npz"
 
 
-def prior_stats(path, bbox=None, min_dbz=0.0, cache=True, verbose=True):
+def prior_stats(path, bbox=None, min_dbz=0.0, cache=True, verbose=True, dataset=None,
+                truth_member=None):
     """N2's workhorse: prior ensemble statistics from one subset file.
 
     Returns a small dict of (nx, ny, nz) fields -- dbz_mean, dbz_spread, n_active,
     dbz_skew, dbz_kurt -- plus (nx, ny) column-max per member and per-variable
     mean/spread. Cached to data/derived/, because every uncached call pays a full
     multi-GB decompress.
+
+    `truth_member` holds one member out, so what comes back is THE PRIOR the
+    assimilation actually saw: Ne = 59, and n_active can be at most 59. With
+    truth_member=None every member is used and n_active reaches 60 -- which is an
+    ensemble statistic, not a prior one. N2 passes 0, the truth member every
+    multi-obs run in this repository was produced with.
     """
-    cf = _cache_key(path, bbox, min_dbz)
+    if dataset is not None:
+        assert_dataset(path, dataset)
+    cf = _cache_key(path, bbox, min_dbz, truth_member)
     if cache:
         hit = _load_cached(cf, path, verbose=verbose)
         if hit is not None:
@@ -543,7 +1093,10 @@ def prior_stats(path, bbox=None, min_dbz=0.0, cache=True, verbose=True):
     if verbose:
         print(f"computing prior_stats for {os.path.basename(os.path.dirname(path))} "
               f"(uncached; decompressing) ...")
-    ens = load_ensemble(path, bbox=bbox)            # (nx, ny, nz, Ne, 8)
+    ens = load_ensemble(path, bbox=bbox)            # (nx, ny, nz, Ne_tot, 8)
+    if truth_member is not None:
+        keep = [m for m in range(ens.shape[3]) if m != int(truth_member)]
+        ens = ens[:, :, :, keep, :]
     dbz = hx(ens, min_dbz=min_dbz).astype(np.float32)   # (nx, ny, nz, Ne)
 
     out = {
@@ -555,6 +1108,7 @@ def prior_stats(path, bbox=None, min_dbz=0.0, cache=True, verbose=True):
         "dbz_colmax_members": dbz.max(axis=2).astype(np.float32),   # (nx, ny, Ne)
         "Ne": np.int32(ens.shape[3]),
         "min_dbz": np.float32(min_dbz),
+        "truth_member": np.int32(-1 if truth_member is None else truth_member),
     }
     for v in VARS:
         out[f"mean_{v}"] = ens[..., VI[v]].mean(axis=3).astype(np.float32)
@@ -568,7 +1122,7 @@ def prior_stats(path, bbox=None, min_dbz=0.0, cache=True, verbose=True):
     return out
 
 
-def section_stats(path, j, min_dbz=0.0, cache=True, verbose=True):
+def section_stats(path, j, min_dbz=0.0, cache=True, verbose=True, dataset=None):
     """Per-member reflectivity on one j row -> (nx, nz, Ne), plus its moments.
 
     prior_stats keeps the members only after the column max is taken, so a vertical
@@ -580,8 +1134,10 @@ def section_stats(path, j, min_dbz=0.0, cache=True, verbose=True):
     Returns dbz_members plus dbz_mean / dbz_max / dbz_spread / n_active /
     dbz_skew / dbz_kurt, all (nx, nz), and the state variables' row mean/spread.
     """
+    if dataset is not None:
+        assert_dataset(path, dataset)
     h = hashlib.sha1(f"{os.path.abspath(path)}|{int(j)}|{min_dbz}".encode()).hexdigest()[:12]
-    cf = DERIVED / f"section_{os.path.basename(os.path.dirname(path))}_j{int(j)}_{h}.npz"
+    cf = DERIVED / f"section_{_cache_stem(path)}_j{int(j)}_{h}.npz"
     if cache:
         hit = _load_cached(cf, path, verbose=verbose)
         if hit is not None:
@@ -625,7 +1181,7 @@ def section_stats(path, j, min_dbz=0.0, cache=True, verbose=True):
 DBZ_HIST_EDGES = np.arange(0.0, 80.0 + 0.25, 0.25)
 
 
-def dbz_histogram(path, edges=None, min_dbz=0.0, bbox=None, cache=True, verbose=True):
+def dbz_histogram(path, edges=None, min_dbz=0.0, bbox=None, cache=True, verbose=True, dataset=None):
     """Counts of every per-member reflectivity value in one subset.
 
     prior_stats keeps moments and column maxima, so the *distribution* of H(x) over
@@ -637,11 +1193,13 @@ def dbz_histogram(path, edges=None, min_dbz=0.0, bbox=None, cache=True, verbose=
     Returns counts (len(edges) - 1), edges, n_total, n_below and n_above -- the two
     tails being values outside the binned range, so the counts always add up.
     """
+    if dataset is not None:
+        assert_dataset(path, dataset)
     edges = DBZ_HIST_EDGES if edges is None else np.asarray(edges, float)
     b = "full" if bbox is None else f"{bbox[0].start}_{bbox[0].stop}_{bbox[1].start}_{bbox[1].stop}"
     h = hashlib.sha1(f"{os.path.abspath(path)}|{b}|{min_dbz}|{edges[0]}|{edges[-1]}|"
                      f"{len(edges)}".encode()).hexdigest()[:12]
-    cf = DERIVED / f"dbzhist_{os.path.basename(os.path.dirname(path))}_{b}_{h}.npz"
+    cf = DERIVED / f"dbzhist_{_cache_stem(path)}_{b}_{h}.npz"
     if cache:
         hit = _load_cached(cf, path, verbose=verbose)
         if hit is not None:
@@ -738,7 +1296,7 @@ def map_field(ax, lats, lons, field_xy, cmap=None, norm=None, rasterized=True, *
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §6  Sweep loading and row alignment
+# 6  Sweep loading and row alignment
 # ═════════════════════════════════════════════════════════════════════════════
 
 META_COLS = ["i", "j", "k", "x_km", "y_km", "z_km", "yo", "yo_clean",
@@ -805,6 +1363,10 @@ def load_runs(spec, columns=None, verbose=True):
     frames = []
     for s in spec:
         for f in sweep_files(s["tag"], s.get("tms")):
+            # A mis-migrated run is caught here rather than being pooled into the wrong
+            # dataset and quietly moving a published number.
+            if s.get("ds") is not None:
+                assert_dataset(f, s["ds"])
             df = load_sweep(f, columns=columns, methods=s.get("methods"), verbose=verbose)
             base = os.path.basename(f)
             df["run"] = s["tag"]
@@ -812,6 +1374,8 @@ def load_runs(spec, columns=None, verbose=True):
             # df.loc would silently be the indexer rather than the column.
             df["loc_km"] = float(s.get("loc", df["lx_km"].iloc[0]))
             df["hour"] = s.get("hour", "")
+            if s.get("ds") is not None:
+                df["ds"] = s["ds"]
             df["Ne"] = int(base.split("_Ne")[1][:3])
             df["tm"] = int(base.rsplit("_tm", 1)[1][:2])
             frames.append(df)
@@ -955,7 +1519,7 @@ def align(df, combos=None, metric_cols=None):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §7  THE convention
+# 7  THE convention
 # ═════════════════════════════════════════════════════════════════════════════
 
 # 'lower'      : smaller is better, compare raw
@@ -1246,7 +1810,7 @@ assert_convention()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §8  Predictors  (N3)
+# 8  Predictors  (N3)
 # ═════════════════════════════════════════════════════════════════════════════
 
 # (column, axis label, percentile clip)
@@ -1282,7 +1846,7 @@ def add_predictors(df, R, Ne=None, dbz_min=0.0):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §9  Binning and density primitives
+# 9  Binning and density primitives
 # ═════════════════════════════════════════════════════════════════════════════
 
 def lims(v, lo=0.5, hi=99.5):
@@ -1344,7 +1908,7 @@ def skill_hexbin(ax, x, y, s, xlim, ylim, gridsize=45, mincnt=40, vmax=None, **k
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §10  Maps and 3-D projections
+# 10  Maps and 3-D projections
 # ═════════════════════════════════════════════════════════════════════════════
 
 AOI = dict(lat=(-41.5, -25.3), lon=(-68.6, -55.4))
@@ -1477,12 +2041,35 @@ def sym_scale(fields):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# §11  Multi-obs, guarded and optional
+# 11  Multi-obs, guarded and optional
 # ═════════════════════════════════════════════════════════════════════════════
 
 def has_multiobs(tag):
     d = run_dir(tag)
     return d.is_dir() and any(d.glob("*_multi_obs_*_Ne*_tm*.npz"))
+
+
+def run_dataset(tag, expected=None):
+    """The dataset_id the files of a run actually carry, checked for agreement.
+
+    N4 reads multi-obs files directly rather than through load_runs, so this is its
+    hook: one call per run says whether every file in that directory agrees with itself
+    and with what the notebook believed.
+    """
+    found = {}
+    for p in sorted(run_dir(tag).glob("*_Ne*_tm*.npz")):
+        found.setdefault(dataset_of(p), []).append(os.path.basename(p))
+    if len(found) > 1:
+        raise ValueError(f"{tag}: its files disagree about which dataset they are: " +
+                         ", ".join(f"{k}({len(v)} files)" for k, v in found.items()))
+    got = next(iter(found), None)
+    if got is None:
+        return None
+    if expected is not None and got != expected:
+        raise ValueError(f"{tag}: the notebook expected dataset {expected} "
+                         f"({DS_DESC.get(expected, '?')}) but its files say {got} "
+                         f"({DS_DESC.get(got, '?')}).")
+    return got
 
 
 def multiobs_files(tag):
@@ -1540,13 +2127,6 @@ def field_rmse(abs_err, mask=None):
     return out
 
 
-def domain_masks(truth_hx, obs_ijk=None, storm_thresh=20.0):
-    """global / storm / obs evaluation domains for a (nx,ny,nz) field."""
-    m = {"global": np.ones(truth_hx.shape, bool)}
-    m["storm"] = np.broadcast_to(
-        (np.nanmax(truth_hx, axis=2) >= storm_thresh)[:, :, None], truth_hx.shape)
-    if obs_ijk is not None:
-        o = np.zeros(truth_hx.shape, bool)
-        o[obs_ijk[0], obs_ijk[1], obs_ijk[2]] = True
-        m["obs"] = o
-    return m
+# domain_masks now comes from da.metrics (imported above). It used to be defined here
+# with the same body; the runner needs it too, and two copies of the definition that
+# decides which cells a published number was averaged over is one copy too many.
