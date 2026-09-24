@@ -117,6 +117,11 @@ def crps_ensemble_sorted(ens, truth, axis=3):
 
 STORM_THRESH_DBZ = 20.0
 
+# Tie band for the cell-wise skill of reflectivity, in dBZ. Reflectivity is censored at
+# the detection floor, so prior and posterior can both sit on it and genuinely tie. The
+# state variables are continuous and in their own units, and use a strict sign instead.
+SKILL_TOL_REF = 1e-3
+
 
 def domain_masks(truth_hx_field, obs_ijk=None, storm_thresh=STORM_THRESH_DBZ):
     """The three evaluation domains for an (nx, ny, nz) field.
@@ -212,6 +217,35 @@ def _emit_domain_scalars(out, domains, var_key, fields, Ne):
                 val, n_used = _finite_reduce(fld, dmask, kind, Ne=Ne)
                 out[f"{metric}_{side}_{dname}_{var_key}"] = val
                 out[f"n_{metric}_{side}_{dname}_{var_key}"] = n_used
+
+
+def _emit_cellwise_skill(out, domains, touched, var_key, err_f, err_a, tol):
+    """Cell-wise skill, |prior error| - |posterior error|, reduced per domain.
+
+    The domain RMSE answers whether a domain's error went down. These answer how many
+    cells improved and by how much the degraded ones got worse: a few cells degrading a
+    lot and many improving a little can give the same RMSE change as the opposite, and
+    the two are different findings.
+
+    Only cells the update reached enter. A cell outside every localization support has
+    xa == xf exactly and a skill of exactly zero, and counting it would drag the median
+    to zero once untouched cells are a majority, reporting coverage as if it were skill.
+    The domain-wide mean is recoverable as skill_mean * n_skill / n_cells.
+    """
+    s = np.abs(err_f) - np.abs(err_a)
+    ok = np.isfinite(s)
+    for dname, dmask in domains.items():
+        v = s[dmask & touched & ok]
+        imp, deg = v > tol, v < -tol
+        out[f"n_skill_{dname}_{var_key}"] = int(v.size)
+        out[f"n_improved_{dname}_{var_key}"] = int(np.count_nonzero(imp))
+        out[f"n_degraded_{dname}_{var_key}"] = int(np.count_nonzero(deg))
+        out[f"skill_mean_{dname}_{var_key}"] = float(v.mean()) if v.size else np.nan
+        out[f"skill_median_{dname}_{var_key}"] = float(np.median(v)) if v.size else np.nan
+        out[f"skill_mean_improved_{dname}_{var_key}"] = (
+            float(v[imp].mean()) if imp.any() else np.nan)
+        out[f"skill_mean_degraded_{dname}_{var_key}"] = (
+            float(v[deg].mean()) if deg.any() else np.nan)
 
 
 def _untouched_mask(xa, xf):
@@ -578,6 +612,13 @@ def compute_multi_obs_metrics(
         out[f"n_cells_{dname}"] = int(np.count_nonzero(dmask))
     out["storm_thresh_dbz"] = float(storm_thresh)
 
+    # Computed here, once, because the cell-wise skill below needs it; the block at the
+    # end of this function reuses it rather than recomputing.
+    untouched = _untouched_mask(xa, xf)
+    touched = ~untouched
+    for dname, dmask in domains.items():
+        out[f"n_touched_{dname}"] = int(np.count_nonzero(touched & dmask))
+
     for iv, vname in enumerate(var_names):
         err_f = xf_mean[..., iv] - truth[..., iv]
         err_a = xa_mean[..., iv] - truth[..., iv]
@@ -588,6 +629,7 @@ def compute_multi_obs_metrics(
             ("skew", "f"): skew_f_field[..., iv], ("skew", "a"): skew_a_field[..., iv],
             ("kurt", "f"): kurt_f_field[..., iv], ("kurt", "a"): kurt_a_field[..., iv],
         }, Ne)
+        _emit_cellwise_skill(out, domains, touched, vname, err_f, err_a, tol=0.0)
 
     # Reflectivity, same reducers and the same key shape, so `_global_ref` reads
     # alongside `_global_{vname}` for vname in var_names.
@@ -600,6 +642,8 @@ def compute_multi_obs_metrics(
             ("kurt", "f"): ref["kurt_f_ref_field"],   ("kurt", "a"): ref["kurt_a_ref_field"],
         })
     _emit_domain_scalars(out, domains, "ref", ref_fields, Ne)
+    _emit_cellwise_skill(out, domains, touched, "ref", err_hxf_field, residual_field,
+                         tol=SKILL_TOL_REF)
 
     if ref:
         # n_active_f_global keeps its historical name and value; the two new domains
@@ -614,8 +658,6 @@ def compute_multi_obs_metrics(
     # touched at all; `frac_touched_no_obs` is the reach of the localization -- the
     # share of updated cells that carry no observation of their own, which is exactly
     # what separates §4.7 from the sweep, where every cell updated is the obs cell.
-    untouched = _untouched_mask(xa, xf)
-    touched = ~untouched
     n_touched = int(np.count_nonzero(touched))
     out["n_touched"] = n_touched
     out["n_untouched"] = int(np.count_nonzero(untouched))

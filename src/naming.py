@@ -51,6 +51,7 @@ believed. So every field is checked against the config rather than trusted:
     mode       == sweep.obs_points.mode
     QC flag    present exactly when qc.dep_band is set, and its code matches the band
     REF/FULL   match the output block's field switches
+    FINAL      present exactly when assimilation.clamp_hydro is "final"
     ALLMEM     present exactly when the run covers more than one truth member
 """
 
@@ -61,7 +62,7 @@ MODES = ("sweep", "multiobs", "point")
 HOURS = ("1800", "1900", "2000", "2100")
 BASE_FLAGS = ("QC", "WIN", "STEPS", "REF", "FULL")
 FIELD_FLAGS = ("REF", "FULL")
-FLAG_ORDER = ("QC", "WIN", "STEPS", "REF", "FULL", "ALLMEM")
+FLAG_ORDER = ("QC", "WIN", "STEPS", "REF", "FULL", "FINAL", "ALLMEM")
 
 STORAGE_LEVELS = ("light", "ref", "full")
 STORAGE_FLAG = {"light": None, "ref": "REF", "full": "FULL"}
@@ -73,7 +74,7 @@ TAG_OF_MODE = {v: k for k, v in MODE_OF_TAG.items()}
 TAG_RE = re.compile(
     r"^WS_(?P<ds>[ABCD])_(?P<mode>sweep|multiobs|point)_"
     r"(?P<hhmm>\d{4})_LOC(?P<loc>[\d.]+)"
-    r"(?P<flags>(_(QC[m\d.t]*|WIN|STEPS|REF|FULL|ALLMEM|AS[\d.]+))*)$"
+    r"(?P<flags>(_(QC[m\d.t]*|WIN|STEPS|REF|FULL|FINAL|ALLMEM|AS[\d.]+))*)$"
 )
 
 SUBSET_RE = re.compile(
@@ -82,7 +83,7 @@ SUBSET_RE = re.compile(
 
 EXPECTED = (
     "WS_{A|B|C|D}_{sweep|multiobs|point}_{HHMM}_LOC{L}[_FLAGS]\n"
-    "  flags, in this order: QC WIN STEPS REF FULL ALLMEM AS<x>\n"
+    "  flags, in this order: QC WIN STEPS REF FULL FINAL ALLMEM AS<x>\n"
     "  e.g. WS_D_sweep_1900_LOC0.1_ALLMEM\n"
     "       WS_C_multiobs_2100_LOC2.0_FULL"
 )
@@ -380,6 +381,16 @@ def validate_experiment_tag(cfg, tag=None):
         elif want is not None and got and got[0] != want:
             problems.append(f"the tag carries {got[0]} but the output block stores "
                             f"{lvl!r} metric fields (expected {want})")
+
+    # FINAL marks the deferred hydrometeor clamp. Read directly rather than through
+    # da.core.clamp_mode_of, to keep this module free of the assimilation imports; the
+    # default must stay the same as there.
+    clamp = str((cfg.get("assimilation") or {}).get("clamp_hydro", "per_step"))
+    if "FINAL" in p["flags"] and clamp != "final":
+        problems.append(f"the tag carries FINAL but assimilation.clamp_hydro is {clamp!r}")
+    if clamp == "final" and "FINAL" not in p["flags"]:
+        problems.append("assimilation.clamp_hydro is 'final' but the tag does not carry "
+                        "FINAL")
 
     if o is not None:
         steps = o["steps_departure"] or o["steps_fields"] or bool(o["steps_cells"])
