@@ -1,8 +1,7 @@
 """
 src/naming.py
 =============
-The naming scheme, in one place, so the runner, the extractor and the migration cannot
-drift apart.
+The naming scheme
 
     WS_{DATASET}_{mode}_{HHMM}_LOC{L}[_{FLAGS}]
     3D_subsets_{DATASET}/subset_{DATASET}_{YYYYMMDDHHMMSS}.npz

@@ -29,25 +29,28 @@ tempering (TEnKF).
 │   └── queue_multiobs.sh            # PBS: multi_obs
 ├── configs/
 │   ├── template.yaml                # full documented reference — start here
+│   ├── test_sanity.yaml             # a small run to check a setup
 │   ├── build_3D_section_Dataset_*.yaml  # data extraction, one per dataset
-│   ├── build_3D_section_wrfout.yaml # data extraction from raw wrfout
-│   └── ws_*.yaml                    # experiment configs (git-ignored)
+│   ├── campaign/                    # the configs of the REF and AS0.25 runs
+│   ├── make_campaign.py             # writes configs/campaign/
+│   ├── submit_campaign.sh           # submits them to PBS
+│   └── ws_*.yaml                    # other experiment configs (git-ignored)
 ├── Notebooks/                       # the analysis layer
-│   ├── nbcommon.py                  # shared helpers + THE sign convention
-│   ├── N1_Prepare_Data.ipynb        # explore WRF output, extract subsets
+│   ├── nbcommon.py                  # shared helpers: paths, style, I/O, languages
+│   ├── N0_Methods_figures.ipynb     # the tempering-weight figure (methodology)
+│   ├── N1_Data.ipynb                # a tour of every file the chain reads
 │   ├── N2_Prior_Conditions.ipynb    # the prior ensemble (no DA output)
-│   ├── N3_Pointwise_Skill.ipynb     # where assimilation helps and hurts
-│   ├── N4_Method_Comparison.ipynb   # AOEI vs LETKF vs TEnKF Nt=1..5
-│   └── figures/                     # PDF + PNG output of the notebooks
+│   ├── N3_Single_obs_experiments.ipynb  # single-observation experiments
+│   ├── N3_Step_by_step.ipynb        # 6 conditions × 10 points, every tempering step
+│   ├── N4_Multiobs.ipynb            # multiple-observation experiments
+│   └── figures/{es,en}/             # every figure, in Spanish and in English
 ├── test/
-│   ├── test_install.py              # can this checkout run an experiment?
-│   └── test_ensemble_stats.py       # skew / kurtosis / CRPS correctness
+│   └── test_install.py              # can this checkout run an experiment?
 ├── data/                            # subsets and results (git-ignored)
 │   ├── 3D_subsets_{A,B,C,D}/        # prepared prior ensembles, one dir per dataset
 │   ├── WS_*/                        # experiment output, one dir per run
-│   └── derived/                     # notebook caches and published tables
-├── logs/                            # PBS job logs
-├── REPO_STRUCTURE.md
+│   └── derived/{N2,N3,N3s,N4}/      # the notebooks' intermediates
+├── logs/                            # PBS job logs (git-ignored)
 └── environment.yml
 ```
 
@@ -100,8 +103,8 @@ LETKF, TEnKF and AOEI end to end. If this passes, the checkout can run experimen
 ## Naming scheme
 
 Everything under `data/` is named dataset-first, so all the files for one dataset sort
-together. The scheme lives in **`src/naming.py`**, which the runner, the extractor and
-the migration all import — there is one definition, not three.
+together. The scheme lives in **`src/naming.py`**, which the runner and the extractor
+both import — there is one definition, not two.
 
 ```
 WS_{DATASET}_{mode}_{HHMM}_LOC{L}[_{FLAGS}]
@@ -197,33 +200,18 @@ the code names the same band), `STEPS` against the `output.steps_*` switches, an
 and mixing it with the deprecated `store_fields` / `storage_level` all fail there.
 `extract_3d_subset.py` does the same for the subset output path and its `dataset_id`.
 
-### Migrating
-
-`src/migrate_naming.py` performed the one-time rename. It is dry-run by default, writes
-`data/derived/rename_manifest.csv` first, and only moves anything on a second invocation
-with `--apply`; `--revert` undoes it from the same manifest and `--verify` re-checks that
-every move landed and every `paths.prepared` resolves. `src/backfill_identity.py` then
-appended the identity keys to the existing files — appended to the npz zip rather than
-rewritten through `np.savez`, which would have meant recompressing ~250 GB.
-
 ## Data preparation
 
 Before running any experiment you need to extract the 3D WRF ensemble subset
-from the raw `wrfout` files or post-processed output.
-
-**Interactive** — open `Notebooks/N1_Prepare_Data.ipynb`: inspect a source file →
-draw the region on a reflectivity map → get the grid indices for the YAML → extract
-→ verify → health-sweep every subset on disk.
-
-**Command line** — once the appropriate config is configured:
+from the raw `wrfout` files or post-processed output. The subsets on disk were built
+from post-processed files with one config per dataset:
 
 ```bash
-# From raw wrfout files:
-python src/extract_3d_subset.py --config configs/build_3D_section_wrfout.yaml
-
-# From post-processed files:
-python src/extract_3d_subset.py --config configs/build_3D_section_post.yaml
+python src/extract_3d_subset.py --config configs/build_3D_section_Dataset_A.yaml
 ```
+
+`format: post` in the config reads post-processed netCDF; `format: wrfout` (the default)
+reads native `wrfout` files through wrf-python.
 
 The output is a compressed `.npz` file:
 
@@ -364,7 +352,6 @@ two modes then disagree. Use a small positive scale instead.
 
 ```bash
 python test/test_install.py          # methods run, AOEI inflates, bounds hold
-python test/test_ensemble_stats.py   # skew / kurtosis / CRPS against closed forms
 ```
 
 ### 2. Observation modes
@@ -663,121 +650,42 @@ The **departure band** is separate, and it is the one that reaches the filename:
 
 ## Analysis
 
-Four notebooks, meant to be read in order. They are configuration plus narrative —
-everything mechanical lives in `Notebooks/nbcommon.py`.
+Six notebooks, in reading order. Each starts with a **section 0** that builds its
+intermediates under `data/derived/` from the raw files, behind a `REBUILD` switch: with
+`REBUILD = False` and the intermediates present it only loads them; if one is missing, or
+with `REBUILD = True`, it rebuilds it and runs its `verify` checks. Analysis cells compute
+the numbers from the intermediates; figure cells only draw. `Notebooks/nbcommon.py` holds
+the shared helpers (paths, run configs, style, the reflectivity operator, subset and sweep
+access, maps, the two figure languages) and no analysis logic.
 
-| Notebook | Reads | Question |
-|---|---|---|
-| **N1** `Prepare_Data` | raw WRF output | What is in the source files, and which subset do we extract? |
-| **N2** `Prior_Conditions` | `3D_subsets_*` **only** | What does the forecast ensemble look like before any observation is used? |
-| **N3** `Pointwise_Skill` | **sweep** output, one truth member × 3 localizations | Where does assimilation improve, where does it degrade, and can the prior predict which? |
-| **N3-1D** `Pointwise_Skill_1D` | **sweep** output, 4 datasets × 4 hours × 60 truth members | Same question at one localization, pooled across datasets and analysis times, plus the state variables. |
-| **N4** `Method_Comparison` | **multi-obs** output | Which method wins — AOEI, LETKF, or TEnKF at Nt = 1…5, with observations interacting? |
+| notebook | reads | writes | what |
+|---|---|---|---|
+| `N0_Methods_figures` | nothing | — | the tempering-weight schedule (methodology chapter) |
+| `N1_Data` | everything below | — | one example of every file type: keys, shapes, units, what a row means; the processing order |
+| `N2_Prior_Conditions` | `3D_subsets_{A,B,C}` | `derived/N2/` | the prior ensemble, before any observation |
+| `N3_Single_obs_experiments` | `WS_{A,B,C}_sweep_*_ALLMEM`, `WS_A_sweep_1900_LOC0.1_ALLMEM_AS0.25` | `derived/N3/` | single-observation experiments: headline, prior predictors, rejection rule, state variables, tempering weights |
+| `N3_Step_by_step` | `3D_subsets_A`, `WS_A_sweep_2000_LOC0.1_ALLMEM` | `derived/N3s/` | 6 conditions × 10 points re-run in the notebook with the runner's update functions, every tempering step recorded |
+| `N4_Multiobs` | `WS_{A,B,C}_multiobs_*_REF`, the subsets, `derived/N2/`, `derived/N3/` | `derived/N4/` | multiple-observation experiments, where observations interact |
 
-N4 reads **multi-obs**, not sweep. It is the only place in this repository where
-observation–observation interaction can appear at all; N3 assimilates every observation
-on its own, so no observation there ever sees another.
+Run N2 and N3 before N4: N4 reads `N2_departures.csv` (the physics of each truth member)
+and the N3 sums (the single-observation reference on the same 12 truth members). Dataset
+D has runs and a subset on disk but enters no notebook.
 
-N2 deliberately touches **no** assimilation output, so it can be run before the
-experiments and is what selects the hour and sub-box they target.
+**Metrics.** One definition everywhere. For a population of experiments: RMSE and CRPS
+over the pooled population, SS_RMSE = 1 − RMSE_a/RMSE_f, SS_CRPS = 1 − CRPS_a/CRPS_f, and
+the fraction improving among the experiments that change (|e| moves by more than the
+variable's tie tolerance, `nb.TOL`). Bands are ±1 standard deviation of the same
+statistic computed per truth member. N3 and N4 store sums (`se2`, `sae`, `scrps`,
+`n_change`, `n_imp`, …) rather than statistics, so any set of rows can be pooled.
 
-### How the notebooks map onto chapter §4.6
+**Figures.** `nb.save(draw, stem)` saves every figure twice, at 300 dpi:
+`Notebooks/figures/es/<stem>.png` and `Notebooks/figures/en/<stem>.png`. `draw(lang)`
+takes every label from the notebook's `LABELS[lang]` and `nb.VOCAB[lang]`; Spanish uses the
+decimal comma. The stems are the ones the thesis includes.
 
-The chapter document is not in this repository, so the intended order is recorded here
-and in the notebook headers. **The localization subsection moved to the end of §4.6.**
-It is exploratory — one truth member, the localization-weighted reduction — and it
-previously sat between the method comparison and the predictors, interrupting the
-argument where the comparison of schemes hands over to the rejection rule built on it.
-
-| thesis | notebook | what |
-|---|---|---|
-| §4.6.1 | N3-1D §1 | the headline: schemes × datasets, fraction improved / median / mean |
-| §4.6.2 | N3-1D §13 | what the 60 truth members are, and how many the multi-obs step needs |
-| §4.6.3 | N3-1D §10, §12 | where tempering helps most; step count vs weight distribution |
-| §4.6.5 | N3-1D §6–§9 | prior conditions, the band criterion, the common rule |
-| §4.6.6 | N3-1D §7a, §7c | the rule the chapter quotes |
-| §4.6.7 | N3-1D §14 | the eight state variables |
-| §4.6.8 | N3-1D §15 | is the state-variable damage selectable from the prior? |
-| §4.6.9 | N3-1D §16 | A against D: does tempering need physics diversity? |
-| §4.6.10 | **N3** | localization — **moved here from §4.6.4** |
-| §4.7 | N4 | the multi-obs experiment |
-
-`N3_Pointwise_Skill.ipynb` has not been re-run against the rebuilt dataset A: its `A`
-is the ensemble now called **D**. Its header says so.
-
-### Verifying that a run is on the subset its name claims
-
-A tag names a dataset and a run's config records the file it was given, but both are
-names, and names survive a migration that moves data. `src/verify_run_subset.py`
-checks the values instead: the sweep stores `truth_point_{var}`, which is
-`state_ensemble[i, j, k, tm, var]` read straight out of the subset, so a run made on
-that file is bit-identical to it.
-
-```bash
-python src/verify_run_subset.py WS_C_sweep_1900_LOC0.1_ALLMEM
-python src/verify_run_subset.py --all-sweeps
-```
-
-Four of dataset C's runs record a path under a `..._DAFCST_...` directory while the
-file the migration consolidated into `3D_subsets_C/` came from a `..._GUES_...` one.
-The value check settles it: they are the same data under a stale name. N3-1D's §0
-refuses any other name mismatch rather than assuming the same.
-
-### The sign convention
-
-`nbcommon` owns one rule, and enforces it:
-
-> Every quantity named **skill** is `prior − analysis`.
-> **Positive means the analysis is better.**
-
-There is no other difference in the module — no `drmse`, no `delta`. `skill()` is
-the only function that subtracts, `skill_label()` generates the axis text from the
-same call chain as the numbers, `CMAP_SKILL` is fixed blue-positive, and
-`assert_convention()` runs **at import**, so flipping the sign breaks every notebook
-at once rather than producing a plausible wrong figure.
-
-`spread` is not a skill metric and `skill(metric='spread')` raises.
-`bias`, `skew` and `kurt` are compared as magnitudes.
-
-### Why N3 and N4 cannot disagree
-
-Both notebooks call exactly one chain:
-
-```
-nb.load_runs(...) -> nb.align(df, combos) -> nb.skill_summary(aligned, metric, var, red)
-```
-
-`align()` inner-joins every method combo on a stable point key, so both notebooks
-necessarily aggregate over the *same* intersected point set, and it reports the NaN
-count per combo — divergent NaN rates are the likeliest real cause of two analyses
-of the same data reaching opposite conclusions. N3 ends by publishing its headline
-table; N4 cell 5 re-derives it and compares against both the published CSV and the
-digest, raising `ConsistencyError` with a row-aligned diff if they differ. N4's
-final cell re-derives every prose conclusion as a PASS/FAIL audit.
-
-### Pointing N3 and N4 at a run
-
-**N3** takes its run list from a `RUNS` literal in cell 1:
-
-```python
-RUNS = [dict(tag="WS_D_sweep_1900_LOC0.1", loc=0.1, hour="19", ds="D"),
-        dict(tag="WS_D_sweep_1900_LOC2.0", loc=2.0, hour="19", ds="D")]
-```
-
-`tag` is the output directory name under `data/`. `ds` is optional but worth setting:
-`load_runs` then reads `dataset_id` out of every file it opens and refuses to pool one
-that disagrees, so a mis-migrated run fails at load instead of being analysed as the
-wrong dataset.
-
-**N4 does not use a literal.** Its §0 discovers the runs under `data/` with the scheme's
-own regex, reads `dataset_id` from inside each file, and asserts that the twelve
-(dataset, hour) cells at `L = 2.0` all resolve — so a renamed or missing directory fails
-loudly rather than silently dropping a dataset. Run N3 first regardless: it publishes
-`data/derived/N3_headline.csv`, which N4's cross-check compares against.
-
-`nbcommon.load_sweep` warns if a file does not have 362 columns, which means it
-predates the reflectivity-metrics change and will be missing the `_ref`,
-`n_active` and `bias_*` columns N3 and N4 depend on.
+**Memory.** `REBUILD = True` decompresses the subsets (~3 GB each for A and B, ~10.6 GB
+for C) and runs in series: macOS starts workers with `spawn`, which cannot send functions
+defined in a notebook. On a 16 GB machine, never hold two C subsets at once.
 
 ---
 
@@ -897,9 +805,8 @@ Four things are asserted rather than assumed:
   also reject departures near −5 dBZ, which are not damaging.
 - **Rejection, not retention.** A point satisfying the condition is dropped.
 - **Evaluated after `clamp_obs` and `filter_variance`, before the assimilation call.**
-  The band was fitted on the sweep's stored `dep_b`, which N3-1D §0a confirmed is
-  post-clamp, so evaluating it anywhere else would apply a different rule than the one
-  the chapter derived.
+  The band was fitted on the sweep's stored `dep_b`, which is post-clamp, so evaluating
+  it anywhere else would apply a different rule than the one the chapter derived.
 - **Evaluated once on the original prior**, with the surviving set held fixed across
   every tempering step. `dep_band_per_step: true` is *not implemented* and raises: it is
   a different method, closer to an iterative robust filter, and an observation rejected
@@ -933,7 +840,7 @@ directory.
 Keep `alpha_s` **scalar**. `LETKF` and `AOEI` de-duplicate on
 `(method, alpha_s, lx, ly, lz)` and have `ntemp` forced to 1, so a *list* of
 `alpha_s` produces duplicate rows differing only in a field that is not part of the
-point key — which `nbcommon.align()` refuses to align, deliberately.
+point key.
 
 ---
 
@@ -942,11 +849,6 @@ point key — which `nbcommon.align()` refuses to align, deliberately.
 | Command | Needs data? | Checks |
 |---|---|---|
 | `python test/test_install.py` | no | Fortran extension imports; `calc_ref` / `calc_ref_ens` agree; LETKF / TEnKF / AOEI run, stay finite, keep hydrometeors ≥ 0 and move toward the observation; AOEI inflates and respects its floor; tempering schedule sums to 1; **`letkf_weights` rebuilds the Fortran analysis from the weights alone**; **light-mode domain scalars equal the same quantities recomputed from full-mode fields**; the three domains can disagree and every scalar carries its denominator; a NaN cell does not poison a protected reduction |
-| `python test/test_ensemble_stats.py` | no | Skewness and excess kurtosis against exact closed forms (Nerger 2022); the O(Ne log Ne) CRPS against the O(Ne²) pairwise reference; both metric entry points for shape, NaN handling and the Ne=1 degenerate case |
-
-`nbcommon` self-tests on import: `assert_convention()` checks the sign of `skill()`
-and the two column-naming hazards, so a broken convention fails every notebook
-immediately rather than producing a plausible wrong figure.
 
 ---
 
@@ -957,5 +859,4 @@ immediately rather than producing a plausible wrong figure.
 - Tempering shows diminishing returns beyond Nt = 5
 
 These are prior findings from earlier experiment rounds, not claims re-derived by
-the current notebooks. N4's closing cell audits its own conclusions against whatever
-output it was run on; treat that audit, not this list, as the current state.
+the current notebooks.

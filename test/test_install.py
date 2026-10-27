@@ -8,8 +8,7 @@ symbols behave, and all three DA methods produce a sane analysis.
 Deliberately data-free and config-free -- it allocates a tiny synthetic 6x6x4
 Ne=10 state in memory, so it passes on a fresh clone with no .npz, no YAML and no
 access to the 76 GB subset tree. That is the whole point: it answers "is this
-install working?", not "is the science right?" (see test_ensemble_stats.py for
-the numerical checks on the diagnostics).
+install working?", not "is the science right?".
 
 Run with:  python test/test_install.py    (from repo root)
 """

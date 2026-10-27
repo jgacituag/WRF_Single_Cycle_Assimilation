@@ -18,5 +18,4 @@ configs/ws*
 *.csv
 *.png
 *.pdf
-*REPO*
-Figures/
+.DS_Store
