@@ -200,12 +200,12 @@ def set_style():
 set_style()
 
 
-def panel_label(ax, letter, loc="upper left", pad=0.02):
+def panel_label(ax, letter, loc="upper left", pad=0.02, fontsize=9):
     """(a)/(b) tag placed outside the title."""
     x, ha = (pad, "left") if "left" in loc else (1 - pad, "right")
     y, va = (1 - pad, "top") if "upper" in loc else (pad, "bottom")
     ax.text(x, y, f"({letter})", transform=ax.transAxes, ha=ha, va=va,
-            fontweight="bold", fontsize=9,
+            fontweight="bold", fontsize=fontsize,
             bbox=dict(fc="white", ec="none", alpha=0.75, pad=1.5))
 
 
@@ -455,8 +455,11 @@ AOI = dict(lat=(-41.5, -25.3), lon=(-68.6, -55.4))
 RASTER_ZORDER = 2.5
 
 def setup_map(ax, extent=None, labels=True, xlocs=None, ylocs=None,
-              left_labels=True, bottom_labels=True, rasterize_below=RASTER_ZORDER):
+              left_labels=True, bottom_labels=True, rasterize_below=RASTER_ZORDER,
+              label_size=6):
     """Cartopy basemap. Returns False (and leaves ax alone) if cartopy is absent.
+
+    `label_size` is the font size [pt] of the latitude/longitude labels.
 
     Everything below `rasterize_below` is flattened to pixels on export: the data
     mesh, the land/ocean fill and the 50 m coastline/border/state geometry. Text,
@@ -491,8 +494,8 @@ def setup_map(ax, extent=None, labels=True, xlocs=None, ylocs=None,
         gl.xlocator = mticker.FixedLocator(xlocs)
     if ylocs is not None:
         gl.ylocator = mticker.FixedLocator(ylocs)
-    gl.xlabel_style = {"size": 6, "rotation": 45, "ha": "right"}
-    gl.ylabel_style = {"size": 6}
+    gl.xlabel_style = {"size": label_size, "rotation": 45, "ha": "right"}
+    gl.ylabel_style = {"size": label_size}
     if rasterize_below is not None:
         ax.set_rasterization_zorder(rasterize_below)
     return True
