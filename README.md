@@ -55,8 +55,8 @@ tempering (TEnKF).
 ```
 
 The compiled `cletkf_wloc*.so` is **git-ignored**, so a fresh clone has only the
-`.f90` sources — `build_fortran.sh` is not optional, and the PBS scripts re-run it
-on every compute node. The experiment configs (`configs/ws*`) are git-ignored too;
+`.f90` sources — `build_fortran.sh` is not optional, and the PBS scripts run it at
+the start of every job. The experiment configs (`configs/ws*`) are git-ignored too;
 the runner copies whichever one it used into the output directory, so each result
 folder is self-describing.
 
@@ -83,11 +83,18 @@ conda activate wrf_python_assimilation
 bash src/build_fortran.sh
 ```
 
-Compiles `cletkf_wloc` via `f2py` from the four `.f90` sources and places the `.so`
-in `src/fortran/`. All runners add that path to `sys.path` automatically. Requires
-`CONDA_PREFIX` to be set and `$CONDA_PREFIX/lib/liblapack.so` to exist; the script
-exits with a clear message if not. On this cluster the queue scripts first run
+Compiles `cletkf_wloc` from the four `.f90` sources with the f2py of the active
+python (`python -m numpy.f2py`, not whichever `f2py` is first on `PATH`) and places
+the `.so` in `src/fortran/`. All runners add that path to `sys.path` automatically.
+Requires `CONDA_PREFIX` to be set and `$CONDA_PREFIX/lib/liblapack.so` to exist; the
+script exits with a clear message if not. On this cluster the queue scripts first run
 `source /opt/load-libs.sh 3`.
+
+Many jobs run it at once against the same `src/fortran/`, so it does not rebuild a
+module that is newer than its sources and imports, and a rebuild happens in a private
+directory and lands with one rename. The old delete-then-rebuild let a job import the
+module while another had just removed it, which killed 2 of the 144 jobs of one
+campaign. `FORCE=1 bash src/build_fortran.sh` rebuilds regardless.
 
 ### 3. Check the installation
 
