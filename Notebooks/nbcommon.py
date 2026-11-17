@@ -681,6 +681,44 @@ def localize(fig, lang):
     return fig
 
 
+# File names in figures/en/. The notebooks give one stem, sometimes in Spanish; the
+# English copy gets an English name. Fragments are replaced in this order (the longer
+# ones first, so "mapa_eco_falso" is not eaten by "eco_falso"). A new Spanish stem
+# needs its fragment here, or figures/en/ gets a Spanish name again.
+STEM_EN = (
+    ("Cap4/caso_radar_19mar", "Ch4/radar_case_19mar"),
+    ("corte_vertical", "cross_section"),
+    ("mapa_diagnostico", "diagnostic_map"),
+    ("posterior_contra_prior", "posterior_vs_prior"),
+    ("observacion_unica_conteos", "single_obs_counts"),
+    ("observacion_unica", "single_obs"),
+    ("mapa_eco_falso", "false_echo_map"),
+    ("eco_falso", "false_echo"),
+    ("regla_observadas", "rule_observed"),
+    ("observadas", "observed"),
+    ("regiones", "regions"),
+    ("ventaja", "advantage"),
+    ("particiones", "partitions"),
+    ("resultado", "result"),
+    ("seleccion", "selection"),
+    ("barrido", "sweep"),
+    ("espacial", "spatial"),
+    ("predictores", "predictors"),
+    ("dispersion", "spread"),
+    ("grupos", "groups"),
+    ("conteos", "counts"),
+)
+
+
+def stem_for(stem, lang):
+    """The file stem of a figure in language `lang` (see STEM_EN)."""
+    _check_lang(lang)
+    if lang == "en":
+        for es, en in STEM_EN:
+            stem = stem.replace(es, en)
+    return stem
+
+
 def save(fig, stem, show=None, dpi=FIG_DPI, langs=None):
     """Draw and save a figure in both languages (or only in `langs`).
 
@@ -695,7 +733,8 @@ def save(fig, stem, show=None, dpi=FIG_DPI, langs=None):
     figures.
 
     `stem` is the name without extension and may include subfolders
-    ("N3s/points/clear/clear_120_80_5_tm03"). Returns the two paths.
+    ("N3s/points/clear/clear_120_80_5_tm03"). In figures/en/ it goes through
+    stem_for(), which turns a Spanish stem into English. Returns the two paths.
 
     `langs` restricts the languages drawn and saved, for exploratory batches
     (langs=("en",)); None is all of LANGS.
@@ -719,7 +758,7 @@ def save(fig, stem, show=None, dpi=FIG_DPI, langs=None):
             raise TypeError(f"the drawing function returned {type(f).__name__}, "
                             f"not a Figure")
         localize(f, lang)
-        p = FIG_DIR / lang / f"{stem}.png"
+        p = FIG_DIR / lang / f"{stem_for(stem, lang)}.png"
         p.parent.mkdir(parents=True, exist_ok=True)
         f.savefig(p, dpi=dpi, bbox_inches="tight")
         paths[lang] = p
