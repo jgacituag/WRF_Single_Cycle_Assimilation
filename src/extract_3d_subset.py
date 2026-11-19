@@ -3,6 +3,12 @@ src/extract_3d_subset.py
 ========================
 Extract a 3D WRF ensemble subset and save it as a compressed .npz file.
 
+No vertical interpolation happens here. With format: post (how every subset on disk
+was built) the extractor reads the upstream cycle's post-processed (POST) files, which
+are already on fixed heights (level_z), picks the eight variables and cuts the domain
+with the subset_3d slices. With format: wrfout it reads the native model levels through
+wrf-python, also without interpolating.
+
 usage:
 
     python src/extract_3d_subset.py --config configs/build_3D_section.yaml
@@ -26,7 +32,11 @@ state_ensemble : (nx, ny, nz, Ne, 8)  float32
       7 - WA      [m/s]
 lats       : (ny, nx)      latitude  [deg]
 lons       : (ny, nx)      longitude [deg]
-z_heights  : (nz, ny, nx)  height above sea level [m]
+z_heights  : (nz, ny, nx)  height [m]
+    format post: the POST files' level_z, height ABOVE GROUND (not above sea level), the
+    same in every column. Those files carry 12 levels, 0.25, 0.5, 1, 2, 3, 4, 5, 6, 8, 10,
+    12 and 14 km; the configs' k_end: -1 drops the last, so the subsets on disk have 11.
+    format wrfout: wrf-python's "z", height above sea level of each native model level.
 valid_mask : (nx, ny, nz)  bool
     False where at least one member carried a non-finite value in at least one
     variable. Those cells are NaN in EVERY member and variable in state_ensemble, so
@@ -34,10 +44,13 @@ valid_mask : (nx, ny, nz)  bool
     alongside as `valid_mask_note`.
 members_read : (Ne,) bool   which member files were found (a missing one is all-NaN
     and is excluded from the union mask)
+    valid_mask, members_read and n_masked_cells are written by this version only. The A,
+    B, C and D subsets on disk were built by an earlier version: they carry none of the
+    three, and a non-finite cell there is NaN only in the member whose source file had it.
 pos_km     : (nx, ny, nz, 3)  real-space position from the lower-left corner [km]
     pos_km[i, j, k, 0] = x  east  distance from corner (i=0, j=0) [km]
     pos_km[i, j, k, 1] = y  north distance from corner (i=0, j=0) [km]
-    pos_km[i, j, k, 2] = z  height above sea level [km]
+    pos_km[i, j, k, 2] = z  z_heights / 1000 [km] (above ground for format post)
     x and y are computed using the equirectangular approximation from each
     point's actual lat/lon to the origin, giving proper x/y components that
     handle grid rotation. Valid for domains up to ~1000 km.
@@ -74,7 +87,8 @@ cross_sections_job:
   subset_3d:
     timeidx: -1    # WRF time index (-1 = last)
     k_start: ~     # vertical level start (null = 0)
-    k_end:   ~     # vertical level end   (null = top)
+    k_end:   ~     # vertical level end, a Python slice end: null keeps every level,
+                   #   -1 -> slice(k_start, -1) drops the last one
     j_start: ~     # south-north start
     j_end:   ~     # south-north end
     i_start: ~     # west-east start
@@ -234,14 +248,14 @@ def _compute_pos_km(lats: np.ndarray, lons: np.ndarray,
     ----------
     lats      : (ny, nx)      latitude  [degrees]
     lons      : (ny, nx)      longitude [degrees]
-    z_heights : (nz, ny, nx)  height above sea level [m]
+    z_heights : (nz, ny, nx)  height [m] (above ground for format post; module docstring)
 
     Returns
     -------
     pos_km : (nx, ny, nz, 3)  float32
         pos_km[i, j, k, 0] = x  east  distance from corner (i=0, j=0) [km]
         pos_km[i, j, k, 1] = y  north distance from corner (i=0, j=0) [km]
-        pos_km[i, j, k, 2] = z  height above sea level [km]
+        pos_km[i, j, k, 2] = z  z_heights / 1000 [km]
 
     Method
     ------
@@ -435,7 +449,7 @@ def _probe_post(nc_path: str, sub_cfg: dict) -> Tuple:
         samp     = nc.variables["T"][0, k_slice, j_slice, i_slice]
         nz, ny, nx = samp.shape
  
-        # broadcast level_z to (nz, ny, nx) -- height is the same everywhere
+        # broadcast level_z to (nz, ny, nx) -- height above ground, the same in every column
         z_sub = np.broadcast_to(
             lev[:, np.newaxis, np.newaxis],
             (nz, ny, nx)

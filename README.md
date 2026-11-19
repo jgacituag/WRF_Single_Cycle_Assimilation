@@ -226,11 +226,34 @@ The output is a compressed `.npz` file:
 |-----|-------|-------------|
 | `state_ensemble` | `(nx, ny, nz, Ne, 8)` | All members |
 | `lats` / `lons` | `(ny, nx)` | **Transposed relative to the state** |
-| `z_heights` | `(nz, ny, nx)` | Height ASL [m] |
-| `pos_km` | `(nx, ny, nz, 3)` | Position [x_km, y_km, z_km] from domain corner |
+| `z_heights` | `(nz, ny, nx)` | Height **above ground** [m]: `level_z` of the POST files, the same in every column (see below) |
+| `pos_km` | `(nx, ny, nz, 3)` | Position [x_km, y_km, z_km]: x, y from the domain corner, z = `z_heights` / 1000 |
 | `valid_mask` | `(nx, ny, nz)` `bool` | `False` where **any** member was non-finite |
 | `members_read` | `(Ne,)` `bool` | which member files were found |
 | `n_masked_cells` | scalar | how many cells the mask removed |
+
+**Vertical levels.** The extractor does not interpolate in the vertical. With
+`format: post` it reads the upstream cycle's post-processed (POST) files, which are already
+on fixed heights (variable `level_z`), picks the eight variables and cuts the domain. Those
+files carry 12 levels; `k_end: -1` in the configs is a Python slice end, so the extractor
+drops the last one (14 km) and every subset on disk has **11 levels, in metres above the
+model terrain, not above sea level**:
+
+| k | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| height above ground [km] | 0.25 | 0.5 | 1 | 2 | 3 | 4 | 5 | 6 | 8 | 10 | 12 |
+
+Because the heights are above ground, no level is ever below the terrain: over the Andes
+the 250 m level sits ~3.5–3.9 km above sea level (P ≈ 640 hPa there, against ~965 hPa
+over the plains). `format: wrfout` would instead store the native model levels, with
+wrf-python's `z` (height above sea level, different in every column) as `z_heights`.
+
+**The subsets on disk predate three of the keys above.** `valid_mask`, `members_read` and
+`n_masked_cells` are written by a newer version of the extractor than the one that built
+the A, B, C and D subsets on disk, which carry none of them. In those subsets a non-finite
+cell is NaN only in the member whose source file had it (two members in 2 of the 1160
+such cells of the A, B, C × 18–21 UTC files), not in all 60; N4 finds and excludes these
+cells itself (`data/derived/N4/N4_nan_cells.csv`).
 
 **`valid_mask` and the union.** A handful of cells arrive non-finite: in dataset A,
 41–56 per hour, identical across all eight variables, never a whole column and never at
@@ -241,7 +264,8 @@ ensemble size than its neighbours, which biases every shape statistic and every
 covariance computed there. So the extractor masks the **union** across all members and
 sets those cells to NaN in every member and variable. It costs ~50 cells out of 1.5 M,
 and the mask is written into the subset so downstream code can assert on it rather than
-rediscover it. Applied to A, B, C and D alike.
+rediscover it. This applies to subsets extracted from now on; the A, B, C and D subsets
+on disk predate it (see above).
 
 Two traps worth stating once. **`lats`/`lons` are `(ny, nx)`** while everything else
 is `(nx, ny, …)` — `nbcommon.map_field` applies the transpose internally so no

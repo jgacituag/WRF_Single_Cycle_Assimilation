@@ -36,7 +36,8 @@ cross_sections_job:
   subset_3d:
     # No timeidx needed — postprocessed files have exactly one time step
     k_start: 0      # vertical level start (null = 0, i.e. lowest level)
-    k_end:   -1      # vertical level end   (null = top)
+    k_end:   -1      # vertical level end, a Python slice end: -1 -> slice(0, -1), which
+                     # drops the last POST level (14 km); null would keep every level
     j_start: 222      # south-north start
     j_end:   673      # south-north end
     i_start: 140      # west-east start
